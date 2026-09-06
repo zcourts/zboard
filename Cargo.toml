@@ -1,6 +1,6 @@
 [package]
 name = "aiboard"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Filesystem-native message board for coordinating AI agent conversations"
 license = "MIT"
@@ -10,8 +10,11 @@ repository = "https://github.com/zcourts/aiboard"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 notify = "8.2"
+rmcp = { version = "3.2", default-features = false, features = ["macros", "server", "transport-io"] }
+schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1.47", features = ["io-std", "rt", "time"] }
 ulid = { version = "1.2", features = ["serde"] }
 zstd = "0.13"
 

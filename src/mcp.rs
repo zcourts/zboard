@@ -1,0 +1,520 @@
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::schemars::JsonSchema;
+use rmcp::{Json, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use serde::{Deserialize, Serialize};
+
+use crate::model::{Agent, AgentStatus, Message};
+use crate::storage::{
+    BoardState, agent_statuses, create_group, direct_reply_recipients, ensure_layout,
+    group_members, join_group, message_is_relevant, publish_message, register_agent, scan,
+    touch_presence,
+};
+
+pub struct McpOptions {
+    pub root: PathBuf,
+    pub project: String,
+    pub session: String,
+    pub project_path: PathBuf,
+    pub poll_interval: Duration,
+}
+
+struct Inner {
+    board: BoardState,
+    inbox: VecDeque<Message>,
+}
+
+#[derive(Clone)]
+pub struct AiboardServer {
+    version_root: PathBuf,
+    agent: Agent,
+    poll_interval: Duration,
+    inner: Arc<Mutex<Inner>>,
+    tool_router: ToolRouter<Self>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SendInput {
+    #[serde(default)]
+    to: Vec<String>,
+    group: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReplyInput {
+    message_id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GroupInput {
+    name: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct HistoryInput {
+    thread: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct PollInput {
+    timeout_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct IdentityOutput {
+    agent: Agent,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct AgentsOutput {
+    agents: Vec<AgentStatus>,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct GroupOutput {
+    name: String,
+    created_by: String,
+    members: Vec<String>,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct GroupsOutput {
+    groups: Vec<GroupOutput>,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct MessageOutput {
+    message: Message,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct MessagesOutput {
+    messages: Vec<Message>,
+    warnings: Vec<String>,
+}
+
+impl AiboardServer {
+    fn new(options: McpOptions) -> Result<Self> {
+        let version_root = ensure_layout(&options.root)?;
+        let agent = register_agent(
+            &version_root,
+            &options.project,
+            &options.session,
+            std::env::consts::OS,
+            &options.project_path,
+        )?;
+        touch_presence(&version_root, &agent.id)?;
+        let mut board = BoardState::default();
+        let initial = scan(&version_root, &mut board);
+        if !initial.warnings.is_empty() {
+            eprintln!(
+                "aiboard: initial scan warnings: {}",
+                initial.warnings.join("; ")
+            );
+        }
+        Ok(Self {
+            version_root,
+            agent,
+            poll_interval: options.poll_interval,
+            inner: Arc::new(Mutex::new(Inner {
+                board,
+                inbox: VecDeque::new(),
+            })),
+            tool_router: Self::tool_router(),
+        })
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Inner>, String> {
+        self.inner
+            .lock()
+            .map_err(|_| "AI Board state lock is poisoned".to_owned())
+    }
+
+    fn refresh(&self, inner: &mut Inner) -> Vec<String> {
+        let result = scan(&self.version_root, &mut inner.board);
+        for id in result.new_messages {
+            if let Some(message) = inner.board.messages.get(&id)
+                && message_is_relevant(&inner.board, &self.agent, message)
+            {
+                inner.inbox.push_back(message.clone());
+            }
+        }
+        result.warnings
+    }
+
+    fn touch(&self, inner: &mut Inner) -> Result<(), String> {
+        let presence = touch_presence(&self.version_root, &self.agent.id)
+            .map_err(|error| format!("{error:#}"))?;
+        inner.board.presence.insert(self.agent.id.clone(), presence);
+        Ok(())
+    }
+
+    fn validate_send(&self, board: &BoardState, input: &SendInput) -> Result<()> {
+        if let Some(group) = input.group.as_deref() {
+            if group != "global" && group != format!("project:{}", self.agent.project) {
+                if !board.groups.contains_key(group) {
+                    bail!("unknown group '{group}'");
+                }
+                if !board
+                    .memberships
+                    .contains(&(group.to_owned(), self.agent.id.clone()))
+                {
+                    bail!("join group '{group}' before sending to it");
+                }
+            }
+        } else if input.to.is_empty() {
+            bail!("provide at least one recipient or a group");
+        } else {
+            let unknown: Vec<_> = input
+                .to
+                .iter()
+                .filter(|recipient| !board.agents.contains_key(recipient.as_str()))
+                .collect();
+            if !unknown.is_empty() {
+                bail!("unknown recipient(s): {unknown:?}");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tool_router]
+impl AiboardServer {
+    #[tool(
+        name = "identity",
+        description = "Return this AI Board agent's registered identity"
+    )]
+    fn identity(&self) -> Result<Json<IdentityOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        Ok(Json(IdentityOutput {
+            agent: self.agent.clone(),
+        }))
+    }
+
+    #[tool(
+        name = "ping",
+        description = "Renew this agent's one-minute online presence"
+    )]
+    fn ping(&self) -> Result<Json<IdentityOutput>, String> {
+        self.identity()
+    }
+
+    #[tool(
+        name = "agents_list",
+        description = "List agents registered on the shared board"
+    )]
+    fn agents_list(&self) -> Result<Json<AgentsOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        self.refresh(&mut inner);
+        Ok(Json(AgentsOutput {
+            agents: agent_statuses(&inner.board),
+        }))
+    }
+
+    #[tool(
+        name = "groups_list",
+        description = "List groups and their registered members"
+    )]
+    fn groups_list(&self) -> Result<Json<GroupsOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        self.refresh(&mut inner);
+        let groups = inner
+            .board
+            .groups
+            .values()
+            .map(|group| GroupOutput {
+                name: group.name.clone(),
+                created_by: group.created_by.clone(),
+                members: group_members(&inner.board, &group.name)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            })
+            .collect();
+        Ok(Json(GroupsOutput { groups }))
+    }
+
+    #[tool(
+        name = "group_create",
+        description = "Create an idempotent collaboration group"
+    )]
+    fn group_create(
+        &self,
+        Parameters(GroupInput { name }): Parameters<GroupInput>,
+    ) -> Result<Json<GroupOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        self.refresh(&mut inner);
+        let group = create_group(&self.version_root, &name, &self.agent.id)
+            .map_err(|error| format!("{error:#}"))?;
+        inner.board.groups.insert(group.name.clone(), group.clone());
+        Ok(Json(GroupOutput {
+            name: group.name,
+            created_by: group.created_by,
+            members: Vec::new(),
+        }))
+    }
+
+    #[tool(
+        name = "group_join",
+        description = "Join an existing collaboration group idempotently"
+    )]
+    fn group_join(
+        &self,
+        Parameters(GroupInput { name }): Parameters<GroupInput>,
+    ) -> Result<Json<GroupOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        self.refresh(&mut inner);
+        let membership = join_group(&self.version_root, &name, &self.agent.id)
+            .map_err(|error| format!("{error:#}"))?;
+        inner
+            .board
+            .memberships
+            .insert((membership.group.clone(), membership.agent));
+        let group = inner
+            .board
+            .groups
+            .get(&name)
+            .ok_or_else(|| format!("unknown group '{name}'"))?;
+        Ok(Json(GroupOutput {
+            name: group.name.clone(),
+            created_by: group.created_by.clone(),
+            members: group_members(&inner.board, &name)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }))
+    }
+
+    #[tool(
+        name = "message_send",
+        description = "Send a direct or group message; provide exactly one target form"
+    )]
+    fn message_send(
+        &self,
+        Parameters(input): Parameters<SendInput>,
+    ) -> Result<Json<MessageOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        self.refresh(&mut inner);
+        self.validate_send(&inner.board, &input)
+            .map_err(|error| format!("{error:#}"))?;
+        let message = publish_message(
+            &self.version_root,
+            &self.agent.id,
+            input.to,
+            input.group,
+            None,
+            None,
+            input.message,
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        inner
+            .board
+            .messages
+            .insert(message.id.clone(), message.clone());
+        Ok(Json(MessageOutput { message }))
+    }
+
+    #[tool(
+        name = "message_reply",
+        description = "Reply to a message while preserving its thread and participants"
+    )]
+    fn message_reply(
+        &self,
+        Parameters(input): Parameters<ReplyInput>,
+    ) -> Result<Json<MessageOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        self.refresh(&mut inner);
+        let parent = inner
+            .board
+            .messages
+            .get(&input.message_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown message '{}'", input.message_id))?;
+        let group = parent.group.clone();
+        let recipients = if group.is_some() {
+            Vec::new()
+        } else {
+            direct_reply_recipients(&parent, &self.agent.id)
+        };
+        if group.is_none() && recipients.is_empty() {
+            return Err("reply has no participant other than the current agent".to_owned());
+        }
+        let message = publish_message(
+            &self.version_root,
+            &self.agent.id,
+            recipients,
+            group,
+            Some(parent.thread),
+            Some(parent.id),
+            input.message,
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        inner
+            .board
+            .messages
+            .insert(message.id.clone(), message.clone());
+        Ok(Json(MessageOutput { message }))
+    }
+
+    #[tool(
+        name = "message_history",
+        description = "Read relevant messages, optionally from one thread, newest window last"
+    )]
+    fn message_history(
+        &self,
+        Parameters(input): Parameters<HistoryInput>,
+    ) -> Result<Json<MessagesOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        let warnings = self.refresh(&mut inner);
+        let limit = input.limit.unwrap_or(50).min(1_000);
+        let mut messages: Vec<_> = inner
+            .board
+            .messages
+            .values()
+            .filter(|message| {
+                (message.from == self.agent.id
+                    || message_is_relevant(&inner.board, &self.agent, message))
+                    && input
+                        .thread
+                        .as_ref()
+                        .is_none_or(|thread| &message.thread == thread)
+            })
+            .cloned()
+            .collect();
+        if messages.len() > limit {
+            messages.drain(..messages.len() - limit);
+        }
+        Ok(Json(MessagesOutput { messages, warnings }))
+    }
+
+    #[tool(
+        name = "inbox_poll",
+        description = "Wait briefly for newly discovered relevant messages"
+    )]
+    async fn inbox_poll(
+        &self,
+        Parameters(input): Parameters<PollInput>,
+    ) -> Result<Json<MessagesOutput>, String> {
+        let timeout = Duration::from_millis(input.timeout_ms.unwrap_or(0).min(30_000));
+        let limit = input.limit.unwrap_or(50).clamp(1, 1_000);
+        let deadline = Instant::now() + timeout;
+        let mut warnings = Vec::new();
+        {
+            let mut inner = self.lock()?;
+            self.touch(&mut inner)?;
+        }
+        loop {
+            {
+                let mut inner = self.lock()?;
+                warnings.extend(self.refresh(&mut inner));
+                if !inner.inbox.is_empty() || Instant::now() >= deadline {
+                    let count = limit.min(inner.inbox.len());
+                    let messages = inner.inbox.drain(..count).collect();
+                    return Ok(Json(MessagesOutput { messages, warnings }));
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(self.poll_interval.min(remaining)).await;
+        }
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for AiboardServer {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        info.server_info = Implementation::new("aiboard", env!("CARGO_PKG_VERSION"))
+            .with_title("AI Board")
+            .with_description("Shared-filesystem coordination for AI-agent conversations")
+            .with_website_url("https://github.com/zcourts/aiboard");
+        info.instructions = Some(format!(
+            "Coordinate only genuine cross-agent dependencies. This server is registered as {}.",
+            self.agent.id
+        ));
+        info
+    }
+}
+
+pub async fn serve(options: McpOptions) -> Result<()> {
+    let server = AiboardServer::new(options)?;
+    let service = server
+        .serve(rmcp::transport::stdio())
+        .await
+        .map_err(|error| anyhow!("start MCP stdio transport: {error}"))?;
+    service.waiting().await.context("run MCP stdio transport")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn options(root: PathBuf, project: &str, session: &str) -> McpOptions {
+        McpOptions {
+            root,
+            project: project.to_owned(),
+            session: session.to_owned(),
+            project_path: PathBuf::from(format!("/{project}")),
+            poll_interval: Duration::from_millis(10),
+        }
+    }
+
+    #[test]
+    fn direct_message_reaches_recipient_inbox() {
+        let directory = tempdir().unwrap();
+        let sender =
+            AiboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
+        let recipient =
+            AiboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
+
+        sender
+            .message_send(Parameters(SendInput {
+                to: vec![recipient.agent.id.clone()],
+                group: None,
+                message: "handoff".to_owned(),
+            }))
+            .unwrap();
+
+        let mut inner = recipient.lock().unwrap();
+        assert!(recipient.refresh(&mut inner).is_empty());
+        let received = inner.inbox.pop_front().unwrap();
+        assert_eq!(received.message, "handoff");
+        assert_eq!(received.from, sender.agent.id);
+    }
+
+    #[test]
+    fn group_send_requires_membership() {
+        let directory = tempdir().unwrap();
+        let server =
+            AiboardServer::new(options(directory.path().to_owned(), "infra", "one")).unwrap();
+        let mut inner = server.lock().unwrap();
+        let group = create_group(&server.version_root, "release", &server.agent.id).unwrap();
+        inner.board.groups.insert(group.name.clone(), group);
+        let input = SendInput {
+            to: Vec::new(),
+            group: Some("release".to_owned()),
+            message: "ready".to_owned(),
+        };
+        assert!(server.validate_send(&inner.board, &input).is_err());
+    }
+}

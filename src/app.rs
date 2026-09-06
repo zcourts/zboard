@@ -11,8 +11,9 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::model::{Command, GroupSummary, Output};
 use crate::storage::{
-    BoardState, create_group, direct_reply_recipients, ensure_layout, group_members, join_group,
-    message_is_relevant, publish_message, register_agent, scan,
+    BoardState, agent_statuses, create_group, direct_reply_recipients, ensure_layout,
+    group_members, join_group, message_is_relevant, publish_message, register_agent, scan,
+    touch_presence,
 };
 
 pub struct RunOptions {
@@ -39,6 +40,7 @@ pub fn run(options: RunOptions) -> Result<()> {
         std::env::consts::OS,
         &options.project_path,
     )?;
+    touch_presence(&version_root, &agent.id)?;
     let mut state = BoardState::default();
     let initial = scan(&version_root, &mut state);
 
@@ -144,6 +146,8 @@ fn handle_command(
     command: Command,
     output: &mut impl Write,
 ) -> Result<()> {
+    let presence = touch_presence(version_root, &agent.id)?;
+    state.presence.insert(agent.id.clone(), presence);
     match command {
         Command::Send { to, group, message } => {
             if let Some(group) = group.as_deref() {
@@ -198,7 +202,7 @@ fn handle_command(
             emit(
                 output,
                 &Output::Agents {
-                    agents: state.agents.values().collect(),
+                    agents: agent_statuses(state),
                 },
             )?;
         }

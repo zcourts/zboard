@@ -1,11 +1,13 @@
+use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const AGENT_SCHEMA: &str = "aiboard.agent.v1";
 pub const MESSAGE_SCHEMA: &str = "aiboard.message.v1";
 pub const GROUP_SCHEMA: &str = "aiboard.group.v1";
 pub const MEMBERSHIP_SCHEMA: &str = "aiboard.membership.v1";
+pub const PRESENCE_SCHEMA: &str = "aiboard.presence.v1";
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub struct Agent {
     pub schema: String,
     pub id: String,
@@ -16,7 +18,7 @@ pub struct Agent {
     pub registered_at: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub struct Message {
     pub schema: String,
     pub id: String,
@@ -32,7 +34,7 @@ pub struct Message {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub struct Group {
     pub schema: String,
     pub name: String,
@@ -46,6 +48,22 @@ pub struct Membership {
     pub group: String,
     pub agent: String,
     pub joined_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+pub struct Presence {
+    pub schema: String,
+    pub id: String,
+    pub agent: String,
+    pub last_seen: String,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub struct AgentStatus {
+    pub agent: Agent,
+    pub online: bool,
+    pub last_seen: Option<String>,
+    pub age_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +108,7 @@ pub enum Output<'a> {
     #[serde(rename = "message")]
     Incoming { message: &'a Message },
     #[serde(rename = "agents")]
-    Agents { agents: Vec<&'a Agent> },
+    Agents { agents: Vec<AgentStatus> },
     #[serde(rename = "groups")]
     Groups { groups: Vec<GroupSummary<'a>> },
     #[serde(rename = "history")]

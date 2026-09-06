@@ -5,14 +5,14 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ulid::{Generator, Ulid};
 
 use crate::model::{
-    AGENT_SCHEMA, Agent, GROUP_SCHEMA, Group, MEMBERSHIP_SCHEMA, MESSAGE_SCHEMA, Membership,
-    Message,
+    AGENT_SCHEMA, Agent, AgentStatus, GROUP_SCHEMA, Group, MEMBERSHIP_SCHEMA, MESSAGE_SCHEMA,
+    Membership, Message, PRESENCE_SCHEMA, Presence,
 };
 
 const DOCUMENT_SUFFIX: &str = ".json.zst";
@@ -27,7 +27,9 @@ pub struct BoardState {
     pub groups: BTreeMap<String, Group>,
     pub memberships: HashSet<(String, String)>,
     pub messages: BTreeMap<String, Message>,
+    pub presence: BTreeMap<String, Presence>,
     loaded_paths: HashSet<PathBuf>,
+    loaded_presence_paths: HashSet<PathBuf>,
     warned_paths: HashSet<PathBuf>,
 }
 
@@ -42,6 +44,7 @@ pub fn ensure_layout(root: &Path) -> Result<PathBuf> {
         version_root.join("agents"),
         version_root.join("groups"),
         version_root.join("messages"),
+        version_root.join("presence"),
     ] {
         fs::create_dir_all(&directory)
             .with_context(|| format!("create board directory {}", directory.display()))?;
@@ -202,6 +205,21 @@ pub fn publish_message(
     Ok(message)
 }
 
+pub fn touch_presence(version_root: &Path, agent_id: &str) -> Result<Presence> {
+    let id = next_ulid().to_string();
+    let presence = Presence {
+        schema: PRESENCE_SCHEMA.to_owned(),
+        id: id.clone(),
+        agent: agent_id.to_owned(),
+        last_seen: timestamp(),
+    };
+    let directory = version_root.join("presence").join(agent_id);
+    let path = directory.join(format!("{id}{DOCUMENT_SUFFIX}"));
+    write_document(&path, &presence)?;
+    prune_presence(&directory, 4);
+    Ok(presence)
+}
+
 pub fn scan(version_root: &Path, state: &mut BoardState) -> ScanResult {
     let mut result = ScanResult {
         new_messages: Vec::new(),
@@ -209,8 +227,43 @@ pub fn scan(version_root: &Path, state: &mut BoardState) -> ScanResult {
     };
     scan_agents(version_root, state, &mut result);
     scan_groups(version_root, state, &mut result);
+    scan_presence(version_root, state, &mut result);
     scan_messages(version_root, state, &mut result);
     result
+}
+
+fn scan_presence(version_root: &Path, state: &mut BoardState, result: &mut ScanResult) {
+    state.loaded_presence_paths.retain(|path| path.exists());
+    let presence_root = version_root.join("presence");
+    for agent_dir in child_directories(&presence_root, result) {
+        let Some(agent_id) = agent_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for path in document_files(&agent_dir, result) {
+            if state.loaded_presence_paths.contains(&path) {
+                continue;
+            }
+            let Some(id) = document_name(&path) else {
+                continue;
+            };
+            match read_document::<Presence>(&path)
+                .and_then(|presence| validate_presence(&presence, id, agent_id).map(|()| presence))
+            {
+                Ok(presence) => {
+                    let replace = state
+                        .presence
+                        .get(agent_id)
+                        .is_none_or(|current| current.id < presence.id);
+                    if replace {
+                        state.presence.insert(agent_id.to_owned(), presence);
+                    }
+                    state.warned_paths.remove(&path);
+                    state.loaded_presence_paths.insert(path);
+                }
+                Err(error) => warn_path(state, result, path, error),
+            }
+        }
+    }
 }
 
 fn scan_agents(version_root: &Path, state: &mut BoardState, result: &mut ScanResult) {
@@ -405,6 +458,39 @@ fn validate_message(message: &Message, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_presence(presence: &Presence, id: &str, agent_id: &str) -> Result<()> {
+    if presence.schema != PRESENCE_SCHEMA || presence.id != id || presence.agent != agent_id {
+        bail!("presence path does not agree with document identity");
+    }
+    presence
+        .id
+        .parse::<Ulid>()
+        .map_err(|error| anyhow!("invalid presence ULID: {error}"))?;
+    DateTime::parse_from_rfc3339(&presence.last_seen)
+        .map_err(|error| anyhow!("invalid presence timestamp: {error}"))?;
+    Ok(())
+}
+
+fn prune_presence(directory: &Path, retain: usize) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(DOCUMENT_SUFFIX))
+        })
+        .collect();
+    paths.sort();
+    let remove_count = paths.len().saturating_sub(retain);
+    for path in paths.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn document_name(path: &Path) -> Option<&str> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -492,6 +578,32 @@ pub fn group_members<'a>(state: &'a BoardState, group: &str) -> Vec<&'a str> {
     members
 }
 
+pub fn agent_statuses(state: &BoardState) -> Vec<AgentStatus> {
+    let now = Utc::now();
+    state
+        .agents
+        .values()
+        .map(|agent| {
+            let presence = state.presence.get(&agent.id);
+            let age_seconds = presence.and_then(|presence| {
+                DateTime::parse_from_rfc3339(&presence.last_seen)
+                    .ok()
+                    .map(|seen| {
+                        now.signed_duration_since(seen.with_timezone(&Utc))
+                            .num_seconds()
+                    })
+                    .map(|age| age.max(0) as u64)
+            });
+            AgentStatus {
+                agent: agent.clone(),
+                online: age_seconds.is_some_and(|age| age <= 60),
+                last_seen: presence.map(|presence| presence.last_seen.clone()),
+                age_seconds,
+            }
+        })
+        .collect()
+}
+
 pub fn message_is_relevant(state: &BoardState, agent: &Agent, message: &Message) -> bool {
     if message.from == agent.id || message.to.iter().any(|recipient| recipient == &agent.id) {
         return message.from != agent.id;
@@ -546,6 +658,35 @@ mod tests {
             register_agent(&root, "infra", "session-123", "linux", Path::new("/two")).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.id, "infra-session123");
+    }
+
+    #[test]
+    fn presence_expires_after_one_minute() {
+        let directory = tempdir().unwrap();
+        let root = ensure_layout(directory.path()).unwrap();
+        let agent =
+            register_agent(&root, "infra", "session", "linux", Path::new("/infra")).unwrap();
+        let current = touch_presence(&root, &agent.id).unwrap();
+        let mut state = BoardState::default();
+        scan(&root, &mut state);
+        let status = agent_statuses(&state).pop().unwrap();
+        assert!(status.online);
+        assert_eq!(
+            status.last_seen.as_deref(),
+            Some(current.last_seen.as_str())
+        );
+
+        state.presence.insert(
+            agent.id.clone(),
+            Presence {
+                schema: PRESENCE_SCHEMA.to_owned(),
+                id: Ulid::new().to_string(),
+                agent: agent.id,
+                last_seen: (Utc::now() - chrono::Duration::seconds(61))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+        );
+        assert!(!agent_statuses(&state).pop().unwrap().online);
     }
 
     #[test]

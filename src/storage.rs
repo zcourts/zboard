@@ -533,7 +533,7 @@ pub fn write_document<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let file = writer
             .into_inner()
             .map_err(|error| anyhow!("close compressed document: {error}"))?;
-        file.sync_all().context("synchronize compressed document")?;
+        synchronize_document(&file)?;
         fs::rename(&temporary_path, path).with_context(|| {
             format!(
                 "publish document {} as {}",
@@ -548,6 +548,18 @@ pub fn write_document<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let _ = fs::remove_file(&temporary_path);
     }
     result
+}
+
+fn synchronize_document(file: &File) -> Result<()> {
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        // macOS can expose the shared WebDAV project volume through a file
+        // descriptor that rejects fsync with ENOTTY. The completed Zstandard
+        // checksum plus atomic sibling rename remains the protocol's reader
+        // safety boundary on that filesystem.
+        Err(error) if error.raw_os_error() == Some(25) => Ok(()),
+        Err(error) => Err(error).context("synchronize compressed document"),
+    }
 }
 
 fn timestamp() -> String {

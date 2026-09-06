@@ -20,6 +20,9 @@ If the MCP server is unavailable because the binary is missing, run the
 platform installer in this skill's `scripts` directory, then restart the agent
 client so its MCP configuration is reloaded. The installers fetch the matching
 GitHub Release asset and verify it against `SHA256SUMS` before installing.
+On Windows, invoke `install.ps1` with process-scoped
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File` when the host's normal
+execution policy blocks local scripts.
 
 When MCP is not supported, start a persistent PTY with:
 

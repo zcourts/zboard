@@ -50,7 +50,7 @@ Windows PowerShell:
 
 ```powershell
 Invoke-WebRequest https://raw.githubusercontent.com/zcourts/aiboard/main/skills/aiboard/scripts/install.ps1 -OutFile install.ps1
-./install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 The installer selects the native x86_64 or ARM64 release, verifies its SHA-256,

@@ -14,6 +14,7 @@ use crate::model::{
     AGENT_SCHEMA, Agent, AgentStatus, GROUP_SCHEMA, Group, MEMBERSHIP_SCHEMA, MESSAGE_SCHEMA,
     Membership, Message, PRESENCE_SCHEMA, Presence,
 };
+use crate::routed::{self, RoutedState};
 
 const DOCUMENT_SUFFIX: &str = ".json.zst";
 
@@ -28,6 +29,7 @@ pub struct BoardState {
     pub memberships: HashSet<(String, String)>,
     pub messages: BTreeMap<String, Message>,
     pub presence: BTreeMap<String, Presence>,
+    pub routed: RoutedState,
     loaded_paths: HashSet<PathBuf>,
     loaded_presence_paths: HashSet<PathBuf>,
     warned_paths: HashSet<PathBuf>,
@@ -39,6 +41,7 @@ pub struct ScanResult {
 }
 
 pub fn ensure_layout(root: &Path) -> Result<PathBuf> {
+    routed::ensure(root)?;
     let version_root = root.join("v1");
     for directory in [
         version_root.join("agents"),
@@ -168,15 +171,24 @@ pub fn join_group(version_root: &Path, name: &str, agent_id: &str) -> Result<Mem
     Ok(membership)
 }
 
-pub fn publish_message(
-    version_root: &Path,
-    from: &str,
-    to: Vec<String>,
-    group: Option<String>,
-    thread: Option<String>,
-    reply_to: Option<String>,
-    body: String,
-) -> Result<Message> {
+pub struct MessageDraft {
+    pub to: Vec<String>,
+    pub group: Option<String>,
+    pub thread: Option<String>,
+    pub reply_to: Option<String>,
+    pub body: String,
+    pub ttl_seconds: Option<u64>,
+}
+
+pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> Result<Message> {
+    let MessageDraft {
+        to,
+        group,
+        thread,
+        reply_to,
+        body,
+        ttl_seconds,
+    } = draft;
     let has_recipients = !to.is_empty();
     if has_recipients == group.is_some() {
         bail!("provide direct recipients or one group, but not both");
@@ -185,6 +197,15 @@ pub fn publish_message(
         bail!("message must not be empty");
     }
 
+    let expires_at = ttl_seconds
+        .map(|seconds| {
+            let seconds = i64::try_from(seconds).context("message TTL is too large")?;
+            Utc::now()
+                .checked_add_signed(chrono::Duration::seconds(seconds))
+                .context("message expiry is out of range")
+                .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        })
+        .transpose()?;
     let id = next_ulid().to_string();
     let message = Message {
         schema: MESSAGE_SCHEMA.to_owned(),
@@ -196,13 +217,40 @@ pub fn publish_message(
         thread: thread.unwrap_or_else(|| id.clone()),
         reply_to,
         message: body,
+        expires_at,
     };
-    let path = version_root
-        .join("messages")
-        .join(Utc::now().format("%Y-%m-%d").to_string())
-        .join(format!("{}{DOCUMENT_SUFFIX}", message.id));
-    write_document(&path, &message)?;
+    routed::publish(board_root(version_root), &message)?;
     Ok(message)
+}
+
+pub fn initialize_routing(
+    version_root: &Path,
+    state: &mut BoardState,
+    agent: &Agent,
+) -> Result<()> {
+    routed::initialize(board_root(version_root), &mut state.routed, agent)
+}
+
+pub fn acknowledge_messages(
+    version_root: &Path,
+    state: &mut BoardState,
+    messages: &[Message],
+) -> Result<()> {
+    routed::acknowledge(board_root(version_root), &mut state.routed, messages)
+}
+
+pub fn relevant_history(
+    version_root: &Path,
+    state: &BoardState,
+    agent: &Agent,
+    thread: Option<&str>,
+    limit: usize,
+) -> (Vec<Message>, Vec<String>) {
+    let groups = state
+        .memberships
+        .iter()
+        .filter_map(|(group, member)| (member == &agent.id).then_some(group.clone()));
+    routed::history(board_root(version_root), agent, groups, thread, limit)
 }
 
 pub fn touch_presence(version_root: &Path, agent_id: &str) -> Result<Presence> {
@@ -228,7 +276,23 @@ pub fn scan(version_root: &Path, state: &mut BoardState) -> ScanResult {
     scan_agents(version_root, state, &mut result);
     scan_groups(version_root, state, &mut result);
     scan_presence(version_root, state, &mut result);
-    scan_messages(version_root, state, &mut result);
+    let groups: Vec<_> = state
+        .memberships
+        .iter()
+        .filter_map(|(group, member)| (member == &state.routed.agent_id).then_some(group.clone()))
+        .collect();
+    let (messages, warnings) = routed::scan(
+        board_root(version_root),
+        &mut state.routed,
+        groups.into_iter(),
+    );
+    result.warnings.extend(warnings);
+    for message in messages {
+        result.new_messages.push(message.id.clone());
+        state.messages.insert(message.id.clone(), message);
+    }
+    result.new_messages.sort();
+    routed::trim_cache(&mut state.messages);
     result
 }
 
@@ -334,30 +398,8 @@ fn scan_groups(version_root: &Path, state: &mut BoardState, result: &mut ScanRes
     }
 }
 
-fn scan_messages(version_root: &Path, state: &mut BoardState, result: &mut ScanResult) {
-    let messages_root = version_root.join("messages");
-    for date_dir in child_directories(&messages_root, result) {
-        for path in document_files(&date_dir, result) {
-            if state.loaded_paths.contains(&path) {
-                continue;
-            }
-            let Some(id) = document_name(&path) else {
-                continue;
-            };
-            match read_document::<Message>(&path)
-                .and_then(|message| validate_message(&message, id).map(|()| message))
-            {
-                Ok(message) => {
-                    let message_id = message.id.clone();
-                    state.messages.insert(message_id.clone(), message);
-                    result.new_messages.push(message_id);
-                    accept_path(state, path);
-                }
-                Err(error) => warn_path(state, result, path, error),
-            }
-        }
-    }
-    result.new_messages.sort();
+fn board_root(version_root: &Path) -> &Path {
+    version_root.parent().unwrap_or(version_root)
 }
 
 fn child_directories(root: &Path, result: &mut ScanResult) -> Vec<PathBuf> {
@@ -440,20 +482,6 @@ fn validate_membership(membership: &Membership, group: &str, agent: &str) -> Res
         || membership.agent != agent
     {
         bail!("membership path does not agree with document identity");
-    }
-    Ok(())
-}
-
-fn validate_message(message: &Message, id: &str) -> Result<()> {
-    if message.schema != MESSAGE_SCHEMA || message.id != id {
-        bail!("message path does not agree with document identity");
-    }
-    message
-        .id
-        .parse::<Ulid>()
-        .map_err(|error| anyhow!("invalid message ULID: {error}"))?;
-    if message.to.is_empty() == message.group.is_none() {
-        bail!("message must target direct recipients or one group");
     }
     Ok(())
 }
@@ -705,29 +733,27 @@ mod tests {
     fn corrupt_document_is_retried_after_replacement() {
         let directory = tempdir().unwrap();
         let root = ensure_layout(directory.path()).unwrap();
-        let message_dir = root.join("messages").join("2026-09-06");
-        fs::create_dir_all(&message_dir).unwrap();
-        let id = Ulid::new().to_string();
-        let path = message_dir.join(format!("{id}{DOCUMENT_SUFFIX}"));
+        let agent_dir = root.join("agents").join("worka");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let path = agent_dir.join(format!("session{DOCUMENT_SUFFIX}"));
         fs::write(&path, b"not zstd").unwrap();
 
         let mut state = BoardState::default();
         assert_eq!(scan(&root, &mut state).warnings.len(), 1);
         assert_eq!(scan(&root, &mut state).warnings.len(), 0);
 
-        let message = Message {
-            schema: MESSAGE_SCHEMA.to_owned(),
-            id: id.clone(),
-            timestamp: timestamp(),
-            from: "worka-a".to_owned(),
-            to: vec!["infra-b".to_owned()],
-            group: None,
-            thread: id.clone(),
-            reply_to: None,
-            message: "fixed".to_owned(),
+        let agent = Agent {
+            schema: AGENT_SCHEMA.to_owned(),
+            id: "worka-session".to_owned(),
+            project: "worka".to_owned(),
+            session_id: "session".to_owned(),
+            platform: "linux".to_owned(),
+            path: "/worka".to_owned(),
+            registered_at: timestamp(),
         };
-        write_document(&path, &message).unwrap();
-        assert_eq!(scan(&root, &mut state).new_messages, vec![id]);
+        write_document(&path, &agent).unwrap();
+        assert!(scan(&root, &mut state).new_messages.is_empty());
+        assert_eq!(state.agents.get("worka-session"), Some(&agent));
     }
 
     #[test]
@@ -755,6 +781,7 @@ mod tests {
             thread: Ulid::new().to_string(),
             reply_to: None,
             message: "hello".to_owned(),
+            expires_at: None,
         };
         assert!(message_is_relevant(
             &state,

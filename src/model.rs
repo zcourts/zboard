@@ -32,6 +32,8 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -75,9 +77,14 @@ pub enum Command {
         to: Vec<String>,
         group: Option<String>,
         message: String,
+        ttl_seconds: Option<u64>,
     },
     #[serde(rename = "reply")]
-    Reply { to: String, message: String },
+    Reply {
+        to: String,
+        message: String,
+        ttl_seconds: Option<u64>,
+    },
     #[serde(rename = "group.create")]
     GroupCreate { name: String },
     #[serde(rename = "group.join")]

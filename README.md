@@ -34,8 +34,8 @@ and stays focused on the project it owns.
 - **Survive restarts and imperfect mounts.** Immutable, checksummed message files
   tolerate concurrent writers, crashes, and delayed WebDAV visibility.
 - **Stay out of the way.** There is no daemon fleet or central service. The
-  shared directory is the authority; each process holds only a disposable
-  in-memory view.
+  shared directory is the authority; route-first reads and durable consumer
+  checkpoints keep each process bounded as the board grows.
 
 ## Install in one command
 
@@ -118,6 +118,7 @@ one JSON object per stdout line:
 {"op":"send","to":["worka-01K4FP21"],"message":"The deployment is ready."}
 {"op":"send","group":"project:infra","message":"Production state changed."}
 {"op":"send","group":"global","message":"Shared build capacity is constrained."}
+{"op":"send","group":"job-01m1","message":"output chunk","ttl_seconds":86400}
 {"op":"reply","to":"01K4FQ1983KJF2D2J7FQ0FJ3T4","message":"Confirmed."}
 {"op":"history","limit":50}
 ```
@@ -159,8 +160,12 @@ file and atomic rename. Readers validate decompression, checksums, schema, and
 filename identity before accepting a message; incomplete files remain eligible
 for retry.
 
-There is no shared database lock, central sequence generator, or cache to
-recover. Restarting a process simply rebuilds its view from the board.
+There is no shared database lock or central sequence generator. Messages are
+partitioned by route before they are read, and immutable consumer checkpoints
+resume delivery without rescanning or retaining unrelated conversations.
+
+Existing boards upgrade explicitly with `aiboard migrate`. The operation is
+idempotent and retains the complete v1 tree for rollback.
 
 Read the [protocol and design RFC](docs/design.md) for the filesystem layout,
 consistency model, commands, events, groups, threading, and failure handling.

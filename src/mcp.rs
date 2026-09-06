@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Agent, AgentStatus, Message};
 use crate::storage::{
-    BoardState, agent_statuses, create_group, direct_reply_recipients, ensure_layout,
-    group_members, join_group, message_is_relevant, publish_message, register_agent, scan,
-    touch_presence,
+    BoardState, MessageDraft, acknowledge_messages, agent_statuses, create_group,
+    direct_reply_recipients, ensure_layout, group_members, initialize_routing, join_group,
+    message_is_relevant, publish_message, register_agent, relevant_history, scan, touch_presence,
 };
 
 pub struct McpOptions {
@@ -46,12 +46,14 @@ struct SendInput {
     to: Vec<String>,
     group: Option<String>,
     message: String,
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReplyInput {
     message_id: String,
     message: String,
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -116,7 +118,14 @@ impl AiboardServer {
         )?;
         touch_presence(&version_root, &agent.id)?;
         let mut board = BoardState::default();
+        initialize_routing(&version_root, &mut board, &agent)?;
         let initial = scan(&version_root, &mut board);
+        let initial_messages: Vec<_> = initial
+            .new_messages
+            .iter()
+            .filter_map(|id| board.messages.get(id).cloned())
+            .collect();
+        acknowledge_messages(&version_root, &mut board, &initial_messages)?;
         if !initial.warnings.is_empty() {
             eprintln!(
                 "aiboard: initial scan warnings: {}",
@@ -317,11 +326,20 @@ impl AiboardServer {
         let message = publish_message(
             &self.version_root,
             &self.agent.id,
-            input.to,
-            input.group,
-            None,
-            None,
-            input.message,
+            MessageDraft {
+                to: input.to,
+                group: input.group,
+                thread: None,
+                reply_to: None,
+                body: input.message,
+                ttl_seconds: input.ttl_seconds,
+            },
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        acknowledge_messages(
+            &self.version_root,
+            &mut inner.board,
+            std::slice::from_ref(&message),
         )
         .map_err(|error| format!("{error:#}"))?;
         inner
@@ -360,11 +378,20 @@ impl AiboardServer {
         let message = publish_message(
             &self.version_root,
             &self.agent.id,
-            recipients,
-            group,
-            Some(parent.thread),
-            Some(parent.id),
-            input.message,
+            MessageDraft {
+                to: recipients,
+                group,
+                thread: Some(parent.thread),
+                reply_to: Some(parent.id),
+                body: input.message,
+                ttl_seconds: input.ttl_seconds,
+            },
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        acknowledge_messages(
+            &self.version_root,
+            &mut inner.board,
+            std::slice::from_ref(&message),
         )
         .map_err(|error| format!("{error:#}"))?;
         inner
@@ -384,25 +411,16 @@ impl AiboardServer {
     ) -> Result<Json<MessagesOutput>, String> {
         let mut inner = self.lock()?;
         self.touch(&mut inner)?;
-        let warnings = self.refresh(&mut inner);
+        let mut warnings = self.refresh(&mut inner);
         let limit = input.limit.unwrap_or(50).min(1_000);
-        let mut messages: Vec<_> = inner
-            .board
-            .messages
-            .values()
-            .filter(|message| {
-                (message.from == self.agent.id
-                    || message_is_relevant(&inner.board, &self.agent, message))
-                    && input
-                        .thread
-                        .as_ref()
-                        .is_none_or(|thread| &message.thread == thread)
-            })
-            .cloned()
-            .collect();
-        if messages.len() > limit {
-            messages.drain(..messages.len() - limit);
-        }
+        let (messages, history_warnings) = relevant_history(
+            &self.version_root,
+            &inner.board,
+            &self.agent,
+            input.thread.as_deref(),
+            limit,
+        );
+        warnings.extend(history_warnings);
         Ok(Json(MessagesOutput { messages, warnings }))
     }
 
@@ -428,7 +446,9 @@ impl AiboardServer {
                 warnings.extend(self.refresh(&mut inner));
                 if !inner.inbox.is_empty() || Instant::now() >= deadline {
                     let count = limit.min(inner.inbox.len());
-                    let messages = inner.inbox.drain(..count).collect();
+                    let messages: Vec<_> = inner.inbox.drain(..count).collect();
+                    acknowledge_messages(&self.version_root, &mut inner.board, &messages)
+                        .map_err(|error| format!("{error:#}"))?;
                     return Ok(Json(MessagesOutput { messages, warnings }));
                 }
             }
@@ -492,6 +512,7 @@ mod tests {
                 to: vec![recipient.agent.id.clone()],
                 group: None,
                 message: "handoff".to_owned(),
+                ttl_seconds: None,
             }))
             .unwrap();
 
@@ -514,6 +535,7 @@ mod tests {
             to: Vec::new(),
             group: Some("release".to_owned()),
             message: "ready".to_owned(),
+            ttl_seconds: None,
         };
         assert!(server.validate_send(&inner.board, &input).is_err());
     }

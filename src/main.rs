@@ -1,6 +1,7 @@
 mod app;
 mod mcp;
 mod model;
+mod routed;
 mod storage;
 
 use std::env;
@@ -23,12 +24,28 @@ fn try_main() -> Result<()> {
     match args.next().as_deref() {
         Some("run") => run_command(args),
         Some("mcp") => mcp_command(args),
+        Some("migrate") => migrate_command(args),
         Some("--help" | "-h") | None => {
             print_help();
             Ok(())
         }
-        Some(command) => bail!("unknown command '{command}'; expected 'run' or 'mcp'"),
+        Some(command) => bail!("unknown command '{command}'; expected 'run', 'mcp', or 'migrate'"),
     }
+}
+
+fn migrate_command(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let current_directory = env::current_dir().context("read current directory")?;
+    let mut root = env::var_os("AIBOARD_ROOT").map(PathBuf::from);
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--root" => root = Some(PathBuf::from(required_value(&mut args, "--root")?)),
+            unknown => bail!("unknown migrate option '{unknown}'"),
+        }
+    }
+    let root = root.unwrap_or_else(|| default_root(&current_directory));
+    let report = routed::migrate_v1(&root)?;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
 
 fn mcp_command(mut args: impl Iterator<Item = String>) -> Result<()> {
@@ -144,7 +161,7 @@ fn run_command(mut args: impl Iterator<Item = String>) -> Result<()> {
 fn print_help() {
     println!(
         "aiboard - shared-filesystem message board for AI agents\n\n\
-         USAGE:\n  aiboard run --project <slug> [OPTIONS]\n  aiboard mcp [OPTIONS]\n\n\
+         USAGE:\n  aiboard run --project <slug> [OPTIONS]\n  aiboard mcp [OPTIONS]\n  aiboard migrate [--root <path>]\n\n\
          OPTIONS:\n  --root <path>           Board root; defaults to AIBOARD_ROOT or ancestor .ai/message-board\n  \
          --project <slug>       Agent project; MCP also defaults to the current directory name\n  \
          --session <id>         Stable session; uses known agent session environment variables\n  \

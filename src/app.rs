@@ -11,9 +11,9 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::model::{Command, GroupSummary, Output};
 use crate::storage::{
-    BoardState, agent_statuses, create_group, direct_reply_recipients, ensure_layout,
-    group_members, join_group, message_is_relevant, publish_message, register_agent, scan,
-    touch_presence,
+    BoardState, MessageDraft, acknowledge_messages, agent_statuses, create_group,
+    direct_reply_recipients, ensure_layout, group_members, initialize_routing, join_group,
+    message_is_relevant, publish_message, register_agent, relevant_history, scan, touch_presence,
 };
 
 pub struct RunOptions {
@@ -42,7 +42,14 @@ pub fn run(options: RunOptions) -> Result<()> {
     )?;
     touch_presence(&version_root, &agent.id)?;
     let mut state = BoardState::default();
+    initialize_routing(&version_root, &mut state, &agent)?;
     let initial = scan(&version_root, &mut state);
+    let initial_messages: Vec<_> = initial
+        .new_messages
+        .iter()
+        .filter_map(|id| state.messages.get(id).cloned())
+        .collect();
+    acknowledge_messages(&version_root, &mut state, &initial_messages)?;
 
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -61,7 +68,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     spawn_stdin_reader(event_tx.clone());
     let filesystem_pending = Arc::new(AtomicBool::new(false));
     let _watcher = start_native_watcher(
-        &version_root,
+        &options.root,
         event_tx.clone(),
         Arc::clone(&filesystem_pending),
         &mut output,
@@ -149,17 +156,38 @@ fn handle_command(
     let presence = touch_presence(version_root, &agent.id)?;
     state.presence.insert(agent.id.clone(), presence);
     match command {
-        Command::Send { to, group, message } => {
+        Command::Send {
+            to,
+            group,
+            message,
+            ttl_seconds,
+        } => {
             if let Some(group) = group.as_deref() {
                 validate_target_group(state, agent, group)?;
             } else {
                 validate_recipients(state, &to)?;
             }
-            let message = publish_message(version_root, &agent.id, to, group, None, None, message)?;
+            let message = publish_message(
+                version_root,
+                &agent.id,
+                MessageDraft {
+                    to,
+                    group,
+                    thread: None,
+                    reply_to: None,
+                    body: message,
+                    ttl_seconds,
+                },
+            )?;
+            acknowledge_messages(version_root, state, std::slice::from_ref(&message))?;
             state.messages.insert(message.id.clone(), message.clone());
             emit(output, &Output::Sent { id: &message.id })?;
         }
-        Command::Reply { to, message } => {
+        Command::Reply {
+            to,
+            message,
+            ttl_seconds,
+        } => {
             let parent = state
                 .messages
                 .get(&to)
@@ -177,12 +205,16 @@ fn handle_command(
             let message = publish_message(
                 version_root,
                 &agent.id,
-                recipients,
-                group,
-                Some(parent.thread),
-                Some(parent.id),
-                message,
+                MessageDraft {
+                    to: recipients,
+                    group,
+                    thread: Some(parent.thread),
+                    reply_to: Some(parent.id),
+                    body: message,
+                    ttl_seconds,
+                },
             )?;
+            acknowledge_messages(version_root, state, std::slice::from_ref(&message))?;
             state.messages.insert(message.id.clone(), message.clone());
             emit(output, &Output::Sent { id: &message.id })?;
         }
@@ -220,20 +252,17 @@ fn handle_command(
         }
         Command::History { thread, limit } => {
             let limit = limit.unwrap_or(50).min(1_000);
-            let mut messages: Vec<_> = state
-                .messages
-                .values()
-                .filter(|message| {
-                    (message.from == agent.id || message_is_relevant(state, agent, message))
-                        && thread
-                            .as_ref()
-                            .is_none_or(|thread| &message.thread == thread)
-                })
-                .collect();
-            if messages.len() > limit {
-                messages.drain(..messages.len() - limit);
+            let (messages, warnings) =
+                relevant_history(version_root, state, agent, thread.as_deref(), limit);
+            for warning in warnings {
+                emit(output, &Output::Warning { message: &warning })?;
             }
-            emit(output, &Output::History { messages })?;
+            emit(
+                output,
+                &Output::History {
+                    messages: messages.iter().collect(),
+                },
+            )?;
         }
         Command::Ping => emit(output, &Output::Pong)?,
     }
@@ -284,6 +313,7 @@ fn reconcile(
     for warning in result.warnings {
         emit(output, &Output::Warning { message: &warning })?;
     }
+    let mut acknowledged = Vec::new();
     for id in result.new_messages {
         let Some(message) = state.messages.get(&id) else {
             continue;
@@ -291,7 +321,9 @@ fn reconcile(
         if message_is_relevant(state, agent, message) {
             emit(output, &Output::Incoming { message })?;
         }
+        acknowledged.push(message.clone());
     }
+    acknowledge_messages(version_root, state, &acknowledged)?;
     Ok(())
 }
 
@@ -318,7 +350,7 @@ fn spawn_stdin_reader(event_tx: Sender<LoopEvent>) {
 }
 
 fn start_native_watcher(
-    version_root: &Path,
+    board_root: &Path,
     event_tx: Sender<LoopEvent>,
     filesystem_pending: Arc<AtomicBool>,
     output: &mut impl Write,
@@ -351,7 +383,7 @@ fn start_native_watcher(
             return None;
         }
     };
-    if let Err(error) = watcher.watch(version_root, RecursiveMode::Recursive) {
+    if let Err(error) = watcher.watch(board_root, RecursiveMode::Recursive) {
         let message = format!("native watcher unavailable; polling remains active: {error}");
         let _ = emit(output, &Output::Warning { message: &message });
         return None;
@@ -449,11 +481,14 @@ mod tests {
         let parent = publish_message(
             &root,
             &other.id,
-            vec![me.id.clone()],
-            None,
-            None,
-            None,
-            "question".to_owned(),
+            MessageDraft {
+                to: vec![me.id.clone()],
+                group: None,
+                thread: None,
+                reply_to: None,
+                body: "question".to_owned(),
+                ttl_seconds: None,
+            },
         )
         .unwrap();
         state.messages.insert(parent.id.clone(), parent.clone());
@@ -466,6 +501,7 @@ mod tests {
             Command::Reply {
                 to: parent.id.clone(),
                 message: "answer".to_owned(),
+                ttl_seconds: None,
             },
             &mut output,
         )
@@ -485,11 +521,14 @@ mod tests {
             let message = publish_message(
                 &root,
                 "worka-other",
-                vec!["infra-session".to_owned()],
-                None,
-                None,
-                None,
-                body.to_owned(),
+                MessageDraft {
+                    to: vec!["infra-session".to_owned()],
+                    group: None,
+                    thread: None,
+                    reply_to: None,
+                    body: body.to_owned(),
+                    ttl_seconds: None,
+                },
             )
             .unwrap();
             state.messages.insert(message.id.clone(), message);
@@ -523,11 +562,14 @@ mod tests {
             let message = publish_message(
                 &root,
                 "worka-other",
-                recipients,
-                None,
-                None,
-                None,
-                body.to_owned(),
+                MessageDraft {
+                    to: recipients,
+                    group: None,
+                    thread: None,
+                    reply_to: None,
+                    body: body.to_owned(),
+                    ttl_seconds: None,
+                },
             )
             .unwrap();
             state.messages.insert(message.id.clone(), message);

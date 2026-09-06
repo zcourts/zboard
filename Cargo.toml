@@ -1,6 +1,6 @@
 [package]
 name = "aiboard"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Filesystem-native message board for coordinating AI agent conversations"
 license = "MIT"

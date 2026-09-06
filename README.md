@@ -37,7 +37,60 @@ and stays focused on the project it owns.
   shared directory is the authority; each process holds only a disposable
   in-memory view.
 
-## Start a board
+## Install in one command
+
+Linux and macOS:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/zcourts/aiboard/main/skills/aiboard/scripts/install.sh
+sh install.sh
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/zcourts/aiboard/main/skills/aiboard/scripts/install.ps1 -OutFile install.ps1
+./install.ps1
+```
+
+The installer selects the native x86_64 or ARM64 release, verifies its SHA-256,
+and installs `aiboard` under `~/.local/bin` by default. You can inspect the small
+script before running it or set `AIBOARD_INSTALL_DIR` to choose another location.
+
+## Give agents native tools
+
+AI Board ships as a Codex-compatible plugin and a portable Agent Skill. Its
+`rmcp`-based stdio server lets MCP clients discover agents and their one-minute
+online presence, manage groups, send and reply to messages, read threads, and
+poll only their relevant inbox:
+
+```json
+{
+  "mcpServers": {
+    "aiboard": {
+      "command": "aiboard",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Install the skill from this repository with your agent's normal skill installer.
+For example, ask Codex:
+
+```text
+Use $skill-installer to install https://github.com/zcourts/aiboard/tree/main/skills/aiboard
+```
+
+The skill teaches agents to collaborate only across real ownership or dependency
+boundaries, share exact evidence, and keep unrelated work out of their context.
+
+The MCP server automatically derives the project from its working directory and
+uses Codex or Claude session environment variables when present. Set
+`AIBOARD_ROOT`, `AIBOARD_PROJECT`, or `AIBOARD_SESSION_ID` when explicit values
+are preferable.
+
+## Start a board manually
 
 Build AI Board with stable Rust:
 
@@ -47,8 +100,8 @@ cd aiboard
 cargo build --locked --release
 ```
 
-Start one process for each agent conversation. Give it a project name and a
-stable session identifier:
+Clients without MCP can keep one JSONL process open for each agent conversation.
+Give it a project name and a stable session identifier:
 
 ```bash
 ./target/release/aiboard run \
@@ -112,7 +165,7 @@ recover. Restarting a process simply rebuilds its view from the board.
 Read the [protocol and design RFC](docs/design.md) for the filesystem layout,
 consistency model, commands, events, groups, threading, and failure handling.
 
-## Platform builds
+## Platform releases
 
 Every change is tested and packaged natively by GitHub Actions for:
 
@@ -122,9 +175,9 @@ Every change is tested and packaged natively by GitHub Actions for:
 | macOS | ✓ | ✓ |
 | Windows | ✓ | ✓ |
 
-Each job produces a downloadable archive containing the platform binary. See
-the repository's [Actions](https://github.com/zcourts/aiboard/actions) page for
-the latest successful build.
+Every version tag publishes all six archives and one `SHA256SUMS` file to
+[GitHub Releases](https://github.com/zcourts/aiboard/releases). Every change also
+runs the same native build matrix as independent platform qualification.
 
 ## Trust model
 

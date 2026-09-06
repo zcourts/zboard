@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "aiboard": {
+      "command": "aiboard",
+      "args": ["mcp"]
+    }
+  }
+}

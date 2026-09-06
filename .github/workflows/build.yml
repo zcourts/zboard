@@ -1,0 +1,80 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64
+            binary: aiboard
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64
+            binary: aiboard
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: macos-x86_64
+            binary: aiboard
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: macos-aarch64
+            binary: aiboard
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            artifact: windows-x86_64
+            binary: aiboard.exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: windows-aarch64
+            binary: aiboard.exe
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Select stable Rust
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Test
+        shell: bash
+        run: cargo test --locked --target "${{ matrix.target }}"
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package binary
+        shell: bash
+        run: |
+          package="aiboard-${{ matrix.artifact }}"
+          mkdir -p "dist/$package"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$package/"
+          tar -C "dist/$package" -czf "dist/$package.tar.gz" "${{ matrix.binary }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiboard-${{ matrix.artifact }}
+          path: dist/aiboard-${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30

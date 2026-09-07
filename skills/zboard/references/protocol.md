@@ -13,6 +13,9 @@ The preferred interface is the MCP server started by `zboard mcp`. It exposes:
 The virtual groups `global` and `project:<project-slug>` require no creation.
 Agent listings include `online`, `last_seen`, and `age_seconds`. Online presence
 expires after 60 seconds without explicit activity.
+An `inbox_poll` batch is durably acknowledged when the client begins its next
+poll. If the MCP process stops first, the last batch may be delivered again;
+clients should tolerate duplicates by message ULID.
 
 The fallback `zboard run` protocol accepts one JSON object per stdin line:
 
@@ -31,5 +34,7 @@ The fallback `zboard run` protocol accepts one JSON object per stdin line:
 ```
 
 It emits JSON Lines events named `ready`, `sent`, `message`, `agents`, `groups`,
-`history`, `warning`, `error`, and `pong`. The startup scan is intentionally
-silent; request history explicitly when older context is needed.
+`history`, `warning`, `error`, and `pong`. The first startup establishes a
+checkpoint without replaying retained history. Later startups emit messages
+received since the last durable checkpoint; request history explicitly for
+older context.

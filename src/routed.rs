@@ -76,7 +76,7 @@ pub fn ensure(root: &Path) -> Result<PathBuf> {
     Ok(v2)
 }
 
-pub fn initialize(root: &Path, state: &mut RoutedState, agent: &Agent) -> Result<()> {
+pub fn initialize(root: &Path, state: &mut RoutedState, agent: &Agent) -> Result<bool> {
     state.agent_id.clone_from(&agent.id);
     state.project.clone_from(&agent.project);
     let directory = consumer_directory(root, &agent.id);
@@ -86,9 +86,11 @@ pub fn initialize(root: &Path, state: &mut RoutedState, agent: &Agent) -> Result
         let checkpoint: Checkpoint = read_document(path)?;
         if checkpoint.schema == CHECKPOINT_SCHEMA && checkpoint.agent == agent.id {
             state.cursors = checkpoint.routes;
+            return Ok(true);
         }
     }
-    Ok(())
+    write_checkpoint(root, state)?;
+    Ok(false)
 }
 
 pub fn publish(root: &Path, message: &Message) -> Result<Vec<PathBuf>> {
@@ -205,6 +207,10 @@ pub fn acknowledge(root: &Path, state: &mut RoutedState, messages: &[Message]) -
                 .drain(..cursor.overlap_ids.len() - CACHE_LIMIT);
         }
     }
+    write_checkpoint(root, state)
+}
+
+fn write_checkpoint(root: &Path, state: &RoutedState) -> Result<()> {
     let id = Ulid::new().to_string();
     let checkpoint = Checkpoint {
         schema: CHECKPOINT_SCHEMA.to_owned(),
@@ -409,7 +415,7 @@ fn write_expiry(root: &Path, message: &Message, expires_at: &str, paths: &[PathB
         expires_at: expires_at.to_owned(),
         paths: paths
             .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| portable_relative_path(root, path))
             .collect(),
     };
     let path = root
@@ -425,24 +431,136 @@ fn write_expiry(root: &Path, message: &Message, expires_at: &str, paths: &[PathB
 
 fn collect_expired(root: &Path) -> Result<()> {
     let now = Utc::now();
-    for path in document_files_recursive(&root.join("v2/expiry")) {
+    let expiry_root = root.join("v2/expiry");
+    for path in due_expiry_files(&expiry_root, now) {
         let expiry: Expiry = match read_document(&path) {
             Ok(expiry) => expiry,
             Err(_) => continue,
         };
+        if expiry.schema != EXPIRY_SCHEMA
+            || document_id(&path).map(|id| id.to_string()).as_deref()
+                != Some(expiry.message.as_str())
+        {
+            bail!("expiry index path does not agree with its message identity");
+        }
         let time = DateTime::parse_from_rfc3339(&expiry.expires_at)?.with_timezone(&Utc);
         if time <= now {
             for target in expiry.paths {
-                match fs::remove_file(target) {
+                match fs::remove_file(resolve_expiry_target(root, &target, &expiry.message)?) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
             }
-            let _ = fs::remove_file(path);
+            let parent = path.parent().map(Path::to_owned);
+            let _ = fs::remove_file(&path);
+            if let Some(parent) = parent {
+                prune_empty_expiry_ancestors(&parent, &expiry_root);
+            }
         }
     }
     Ok(())
+}
+
+fn resolve_expiry_target(root: &Path, stored: &str, message: &str) -> Result<PathBuf> {
+    let normalized = stored.replace('\\', "/");
+    let path = Path::new(&normalized);
+    let components: Vec<_> = path.components().collect();
+    if components
+        .iter()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("expiry target contains a parent traversal");
+    }
+    let candidate = if path.starts_with(root) {
+        path.to_owned()
+    } else if let Some(index) = components
+        .iter()
+        .position(|component| component.as_os_str() == "v2")
+    {
+        components[index..].iter().fold(root.to_owned(), |path, component| {
+            path.join(component.as_os_str())
+        })
+    } else if path.is_relative() {
+        root.join(path)
+    } else {
+        bail!("expiry target is outside the board root");
+    };
+    let expected_name = format!("{message}{DOCUMENT_SUFFIX}");
+    if !candidate.starts_with(root.join("v2/messages"))
+        || candidate.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+    {
+        bail!("expiry target is not the indexed message inside v2/messages");
+    }
+    Ok(candidate)
+}
+
+fn portable_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn due_expiry_files(root: &Path, now: DateTime<Utc>) -> Vec<PathBuf> {
+    let current = [
+        format!("{:04}", now.year()),
+        format!("{:02}", now.month()),
+        format!("{:02}", now.day()),
+        format!("{:02}", now.hour()),
+        format!("{:02}", now.minute()),
+    ];
+    let mut pending = vec![(root.to_owned(), Vec::<String>::new())];
+    let mut files = Vec::new();
+    while let Some((directory, prefix)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if prefix.len() == current.len() {
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(DOCUMENT_SUFFIX))
+                {
+                    files.push(path);
+                }
+                continue;
+            }
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(component) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let mut candidate = prefix.clone();
+            candidate.push(component);
+            if candidate.as_slice() <= &current[..candidate.len()] {
+                pending.push((path, candidate));
+            }
+        }
+    }
+    files
+}
+
+fn prune_empty_expiry_ancestors(start: &Path, root: &Path) {
+    let mut current = start.to_owned();
+    while current != root {
+        if fs::remove_dir(&current).is_err() {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_owned();
+    }
 }
 
 fn is_expired(message: &Message) -> bool {
@@ -621,14 +739,14 @@ mod tests {
         publish(root.path(), &newer).unwrap();
 
         let mut first = RoutedState::default();
-        initialize(root.path(), &mut first, &agent()).unwrap();
+        assert!(!initialize(root.path(), &mut first, &agent()).unwrap());
         let (received, warnings) = scan(root.path(), &mut first, std::iter::empty());
         assert!(warnings.is_empty());
         assert_eq!(received, vec![newer]);
         acknowledge(root.path(), &mut first, &received).unwrap();
 
         let mut resumed = RoutedState::default();
-        initialize(root.path(), &mut resumed, &agent()).unwrap();
+        assert!(initialize(root.path(), &mut resumed, &agent()).unwrap());
         assert!(
             scan(root.path(), &mut resumed, std::iter::empty())
                 .0
@@ -657,5 +775,108 @@ mod tests {
         collect_expired(root.path()).unwrap();
         assert!(paths.iter().all(|path| !path.exists()));
         assert!(document_files_recursive(&root.path().join("v2/expiry")).is_empty());
+    }
+
+    #[test]
+    fn expiry_collection_does_not_visit_future_partitions() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let mut value = message(Ulid::new().to_string());
+        value.expires_at = Some(
+            (Utc::now() + chrono::Duration::days(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        let paths = publish(root.path(), &value).unwrap();
+
+        collect_expired(root.path()).unwrap();
+
+        assert!(paths.iter().all(|path| path.exists()));
+        assert_eq!(
+            document_files_recursive(&root.path().join("v2/expiry")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn expiry_paths_survive_board_root_relocation() {
+        let directory = tempdir().unwrap();
+        let original = directory.path().join("debian-board");
+        ensure(&original).unwrap();
+        let mut value = message(Ulid::new().to_string());
+        value.expires_at = Some(
+            (Utc::now() - chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        publish(&original, &value).unwrap();
+        let expiry_path = document_files_recursive(&original.join("v2/expiry"))
+            .pop()
+            .unwrap();
+        let expiry: Expiry = read_document(&expiry_path).unwrap();
+        assert!(expiry.paths.iter().all(|path| {
+            path.starts_with("v2/messages/") && !path.contains('\\')
+        }));
+        let relocated = directory.path().join("macos-board");
+        fs::rename(&original, &relocated).unwrap();
+
+        collect_expired(&relocated).unwrap();
+
+        assert!(document_files_recursive(&relocated.join("v2/messages")).is_empty());
+        assert!(document_files_recursive(&relocated.join("v2/expiry")).is_empty());
+    }
+
+    #[test]
+    fn expiry_index_cannot_delete_outside_message_storage() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("board");
+        ensure(&root).unwrap();
+        let secret = directory.path().join("keep-me");
+        fs::write(&secret, b"safe").unwrap();
+        let id = Ulid::new().to_string();
+        let expired = Utc::now() - chrono::Duration::seconds(1);
+        let expiry = Expiry {
+            schema: EXPIRY_SCHEMA.to_owned(),
+            message: id.clone(),
+            expires_at: expired.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            paths: vec![secret.to_string_lossy().into_owned()],
+        };
+        let index = root
+            .join("v2/expiry")
+            .join(format!("{:04}", expired.year()))
+            .join(format!("{:02}", expired.month()))
+            .join(format!("{:02}", expired.day()))
+            .join(format!("{:02}", expired.hour()))
+            .join(format!("{:02}", expired.minute()))
+            .join(format!("{id}{DOCUMENT_SUFFIX}"));
+        write_document(&index, &expiry).unwrap();
+
+        assert!(collect_expired(&root).is_err());
+        assert_eq!(fs::read(&secret).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_retains_legacy_messages() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let value = message(Ulid::new().to_string());
+        let legacy = root
+            .path()
+            .join("v1/messages/2026-09-06")
+            .join(format!("{}.json.zst", value.id));
+        write_document(&legacy, &value).unwrap();
+
+        let first = migrate_v1(root.path()).unwrap();
+        assert_eq!(first.migrated, 1);
+        assert_eq!(first.already_present, 0);
+        assert!(first.retained_legacy);
+        assert!(legacy.exists());
+        for route in message_routes(&value) {
+            let destination = message_path(root.path(), &route, &value).unwrap();
+            assert_eq!(read_document::<Message>(&destination).unwrap(), value);
+        }
+
+        let second = migrate_v1(root.path()).unwrap();
+        assert_eq!(second.migrated, 0);
+        assert_eq!(second.already_present, 1);
+        assert!(legacy.exists());
     }
 }

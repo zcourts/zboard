@@ -230,7 +230,7 @@ pub fn initialize_routing(
     version_root: &Path,
     state: &mut BoardState,
     agent: &Agent,
-) -> Result<()> {
+) -> Result<bool> {
     routed::initialize(board_root(version_root), &mut state.routed, agent)
 }
 

@@ -42,14 +42,16 @@ pub fn run(options: RunOptions) -> Result<()> {
     )?;
     touch_presence(&version_root, &agent.id)?;
     let mut state = BoardState::default();
-    initialize_routing(&version_root, &mut state, &agent)?;
+    let resumed = initialize_routing(&version_root, &mut state, &agent)?;
     let initial = scan(&version_root, &mut state);
     let initial_messages: Vec<_> = initial
         .new_messages
         .iter()
         .filter_map(|id| state.messages.get(id).cloned())
         .collect();
-    acknowledge_messages(&version_root, &mut state, &initial_messages)?;
+    if !resumed {
+        acknowledge_messages(&version_root, &mut state, &initial_messages)?;
+    }
 
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -63,6 +65,16 @@ pub fn run(options: RunOptions) -> Result<()> {
             latest: state.messages.keys().next_back().map(String::as_str),
         },
     )?;
+    if resumed {
+        let mut delivered = Vec::new();
+        for message in &initial_messages {
+            if message_is_relevant(&state, &agent, message) {
+                emit(&mut output, &Output::Incoming { message })?;
+                delivered.push(message.clone());
+            }
+        }
+        acknowledge_messages(&version_root, &mut state, &delivered)?;
+    }
 
     let (event_tx, event_rx) = mpsc::channel();
     spawn_stdin_reader(event_tx.clone());
@@ -94,8 +106,11 @@ fn event_loop(
     poll_interval: Duration,
     output: &mut impl Write,
 ) -> Result<()> {
+    let mut reconcile_at = std::time::Instant::now() + poll_interval;
     loop {
-        match event_rx.recv_timeout(poll_interval) {
+        let timeout = reconcile_at.saturating_duration_since(std::time::Instant::now());
+        let mut reconcile_due = false;
+        match event_rx.recv_timeout(timeout) {
             Ok(LoopEvent::Input(line)) => handle_line(version_root, agent, state, &line, output)?,
             Ok(LoopEvent::InputClosed) => return Ok(()),
             Ok(LoopEvent::WatchWarning(message)) => {
@@ -103,11 +118,17 @@ fn event_loop(
             }
             Ok(LoopEvent::Filesystem) => {
                 filesystem_pending.store(false, Ordering::Release);
+                reconcile_at = reconcile_at.min(
+                    std::time::Instant::now() + Duration::from_millis(50),
+                );
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => reconcile_due = true,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        reconcile(version_root, agent, state, output)?;
+        if reconcile_due || std::time::Instant::now() >= reconcile_at {
+            reconcile(version_root, agent, state, output)?;
+            reconcile_at = std::time::Instant::now() + poll_interval;
+        }
     }
 }
 

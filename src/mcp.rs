@@ -30,6 +30,7 @@ pub struct McpOptions {
 struct Inner {
     board: BoardState,
     inbox: VecDeque<Message>,
+    pending_ack: Vec<Message>,
 }
 
 #[derive(Clone)]
@@ -122,14 +123,24 @@ impl ZboardServer {
         )?;
         touch_presence(&version_root, &agent.id)?;
         let mut board = BoardState::default();
-        initialize_routing(&version_root, &mut board, &agent)?;
+        let resumed = initialize_routing(&version_root, &mut board, &agent)?;
         let initial = scan(&version_root, &mut board);
         let initial_messages: Vec<_> = initial
             .new_messages
             .iter()
             .filter_map(|id| board.messages.get(id).cloned())
             .collect();
-        acknowledge_messages(&version_root, &mut board, &initial_messages)?;
+        let mut inbox = VecDeque::new();
+        if resumed {
+            inbox.extend(
+                initial_messages
+                    .iter()
+                    .filter(|message| message_is_relevant(&board, &agent, message))
+                    .cloned(),
+            );
+        } else {
+            acknowledge_messages(&version_root, &mut board, &initial_messages)?;
+        }
         if !initial.warnings.is_empty() {
             eprintln!(
                 "zboard: initial scan warnings: {}",
@@ -142,7 +153,8 @@ impl ZboardServer {
             poll_interval: options.poll_interval,
             inner: Arc::new(Mutex::new(Inner {
                 board,
-                inbox: VecDeque::new(),
+                inbox,
+                pending_ack: Vec::new(),
             })),
             tool_router: Self::tool_router(),
         })
@@ -446,6 +458,12 @@ impl ZboardServer {
         {
             let mut inner = self.lock()?;
             self.touch(&mut inner)?;
+            let delivered = std::mem::take(&mut inner.pending_ack);
+            if let Err(error) = acknowledge_messages(&self.version_root, &mut inner.board, &delivered)
+            {
+                inner.pending_ack = delivered;
+                return Err(format!("{error:#}"));
+            }
         }
         loop {
             {
@@ -454,8 +472,7 @@ impl ZboardServer {
                 if !inner.inbox.is_empty() || Instant::now() >= deadline {
                     let count = limit.min(inner.inbox.len());
                     let messages: Vec<_> = inner.inbox.drain(..count).collect();
-                    acknowledge_messages(&self.version_root, &mut inner.board, &messages)
-                        .map_err(|error| format!("{error:#}"))?;
+                    inner.pending_ack.clone_from(&messages);
                     return Ok(Json(MessagesOutput { messages, warnings }));
                 }
             }
@@ -551,5 +568,81 @@ mod tests {
             ttl_seconds: None,
         };
         assert!(server.validate_send(&inner.board, &input).is_err());
+    }
+
+    #[test]
+    fn restart_delivers_messages_received_while_offline() {
+        let directory = tempdir().unwrap();
+        let recipient_options = options(directory.path().to_owned(), "infra", "two");
+        let recipient = ZboardServer::new(recipient_options).unwrap();
+        let recipient_id = recipient.agent.id.clone();
+        drop(recipient);
+        let sender =
+            ZboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
+        sender
+            .message_send(Parameters(SendInput {
+                to: vec![recipient_id],
+                group: None,
+                message: "while offline".to_owned(),
+                meta: None,
+                ttl_seconds: None,
+            }))
+            .unwrap();
+
+        let resumed = ZboardServer::new(options(directory.path().to_owned(), "infra", "two"))
+            .unwrap();
+        let inner = resumed.lock().unwrap();
+        assert_eq!(inner.inbox.len(), 1);
+        assert_eq!(inner.inbox[0].message, "while offline");
+    }
+
+    #[test]
+    fn mcp_poll_acknowledges_only_after_the_next_poll() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempdir().unwrap();
+            let recipient_options = options(directory.path().to_owned(), "infra", "two");
+            let recipient = ZboardServer::new(recipient_options).unwrap();
+            let recipient_id = recipient.agent.id.clone();
+            let sender =
+                ZboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
+            sender
+                .message_send(Parameters(SendInput {
+                    to: vec![recipient_id],
+                    group: None,
+                    message: "at least once".to_owned(),
+                    meta: None,
+                    ttl_seconds: None,
+                }))
+                .unwrap();
+
+            let first = recipient
+                .inbox_poll(Parameters(PollInput::default()))
+                .await
+                .unwrap();
+            assert_eq!(first.0.messages.len(), 1);
+            drop(recipient);
+
+            let resumed =
+                ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
+            let replayed = resumed
+                .inbox_poll(Parameters(PollInput::default()))
+                .await
+                .unwrap();
+            assert_eq!(replayed.0.messages.len(), 1);
+            let acknowledged = resumed
+                .inbox_poll(Parameters(PollInput::default()))
+                .await
+                .unwrap();
+            assert!(acknowledged.0.messages.is_empty());
+            drop(resumed);
+
+            let final_restart =
+                ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
+            assert!(final_restart.lock().unwrap().inbox.is_empty());
+        });
     }
 }

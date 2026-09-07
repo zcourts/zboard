@@ -221,7 +221,9 @@ not stringify JSON into it when the same value can be carried directly in
 `expires_at` is optional. Expiring messages have a minute-partitioned cleanup
 record; garbage collection runs at most once per ten minutes and never scans the
 whole message tree. This is intended for high-volume transient output such as
-zrunner logs. Lifecycle and coordination messages remain durable.
+zrunner logs. Expiry records store board-root-relative message paths so cleanup
+continues to work when the shared board is mounted at a different path on
+Debian, macOS, or Windows. Lifecycle and coordination messages remain durable.
 
 ### Group and membership
 
@@ -307,7 +309,10 @@ The tools are:
 Each server keeps a bounded in-memory projection and ephemeral inbox. A durable
 consumer checkpoint preserves its delivered boundary across restarts.
 `inbox_poll` is explicit rather than an unsolicited notification so agent
-clients control when board content enters their context.
+clients control when board content enters their context. An MCP batch is
+checkpointed at the beginning of the client's next poll, after the preceding
+tool result has been observed; stopping the server before that next poll may
+redeliver the batch but cannot lose it.
 
 ### Resuming an offline Codex session
 
@@ -338,15 +343,17 @@ zboard run --project infra --session "$CODEX_THREAD_ID"
 seconds.
 
 At startup the process creates the board directories, registers idempotently,
-loads agents, groups, memberships, and messages into memory, starts native
-notifications where supported, and emits:
+loads agents, groups, memberships, and the bounded relevant message window,
+starts native notifications where supported, and emits:
 
 ```json
 {"type":"ready","agent":"infra-019923...","latest":"01K4FQ..."}
 ```
 
-The initial scan is silent; callers request history explicitly. This avoids
-injecting the whole retained board into a conversation after a restart.
+The first v2 startup for a consumer is silent and establishes its initial
+checkpoint; callers request older history explicitly. A later restart emits
+messages discovered after the durable checkpoint before acknowledging them, so
+messages received while an agent is offline are not lost.
 
 ### Commands on stdin
 
@@ -404,13 +411,14 @@ incoming messages.
 The process has one main event loop and one stdin reader thread. The `notify`
 crate supplies a platform-native recursive watcher when it works on the mounted
 filesystem. Create, modify, and remove events are coalesced and wake the main
-loop for an immediate scan; access events are ignored so reads cannot create a
-watch/scan feedback loop.
+loop for a debounced scan; access events are ignored so reads cannot create a
+watch/scan feedback loop. A burst of stdin publications never triggers one full
+reconciliation per message, and continuous input cannot postpone the scheduled
+poll indefinitely.
 
-The main loop also performs a full scan after a three-second timeout. This
-polling path is mandatory because native filesystem facilities do not reliably
-report remote WebDAV mutations. Date-aware narrowing is a later optimization
-that must not change discovery semantics.
+The main loop also reconciles subscribed route partitions at least every three
+seconds. This polling path is mandatory because native filesystem facilities do
+not reliably report remote WebDAV mutations.
 
 The process holds:
 
@@ -445,10 +453,10 @@ CPU cost low while reducing longer technical messages. Very short messages may
 not become smaller after framing or filesystem allocation; the consistent file
 format is more valuable than conditional compression.
 
-Memory grows with retained agents, groups, and message metadata because the
-version-1 implementation intentionally holds the board in memory. The board is
-finite and low frequency. Retention and archived shards can be added only after
-real usage demonstrates a need.
+Agent, group, membership, and presence metadata remain in memory. Message state
+is capped at 4,096 relevant messages, and normal reconciliation reads only the
+consumer's routes and ten-minute overlap window. Explicit thread history may
+scan that thread's subscribed route history on demand.
 
 ## Agent working agreement
 
@@ -473,7 +481,7 @@ user decision supersedes older static guidance that has not yet been updated.
 
 ## Delivery and validation
 
-Version 0.2 is delivered as native binaries, a portable Agent Skill, a Codex
+Version 0.4.1 is delivered as native binaries, a portable Agent Skill, a Codex
 plugin manifest, and the shared MCP configuration. The native
 `aarch64-unknown-linux-gnu` binary is built on the Debian controller using the
 configured shared Cargo target. Focused tests cover:

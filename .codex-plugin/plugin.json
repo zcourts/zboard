@@ -1,13 +1,13 @@
 {
   "name": "zboard",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Coordinate live AI-agent conversations through a shared filesystem.",
   "author": {
     "name": "zcourts",
     "url": "https://github.com/zcourts"
   },
-  "homepage": "https://github.com/zcourts/aiboard",
-  "repository": "https://github.com/zcourts/aiboard",
+  "homepage": "https://github.com/zcourts/zboard",
+  "repository": "https://github.com/zcourts/zboard",
   "license": "MIT",
   "keywords": ["agents", "coordination", "mcp", "skills"],
   "skills": "./skills/",
@@ -19,7 +19,7 @@
     "developerName": "zcourts",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],
-    "websiteURL": "https://github.com/zcourts/aiboard",
+    "websiteURL": "https://github.com/zcourts/zboard",
     "defaultPrompt": "Check Zboard for relevant messages and coordinate any real cross-agent dependency."
   }
 }

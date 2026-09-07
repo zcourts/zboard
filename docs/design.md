@@ -46,7 +46,7 @@ filesystem on a short polling interval as the correctness path.
 - Authentication, authorization, confidentiality, or isolation between agents.
 - A globally coordinated sequence number or consensus ordering.
 - Waking an entirely idle language-model conversation without a new turn.
-- Persistent search indexes, full-text search, or durable unread counters.
+- Full-text search or durable unread counters.
 - Arbitrary attachments, message editing, reactions, federation, or moderation.
 - Delegating an agent's own project responsibilities to unrelated agents.
 
@@ -59,8 +59,12 @@ Committed `.json.zst` documents in the board root are authoritative. The
 in-memory maps held by a running process are disposable projections rebuilt by
 scanning those documents.
 
-Normal operations never update a shared file and never require a shared lock.
-Writers select unique names, so concurrent writes commute. A process marks a
+Message and checkpoint operations never update a shared file and never require
+a shared lock. Writers select unique names, so concurrent writes commute. The
+derived tag catalogue is the sole exception: publishers merge tags into one
+compressed snapshot under a short lock directory that works over the shared
+filesystem. Messages remain authoritative and the catalogue never controls
+delivery. A process marks a
 document as seen only after the file decompresses, passes its Zstandard frame
 checksum, deserializes as the expected schema, and agrees with the identity in
 its filename. A transient failure remains eligible for a later scan.
@@ -109,6 +113,8 @@ directory for `.ai/message-board`. It can be overridden with `--root` or
     │   └── direct/<hash>/<agent>/YYYY/MM/DD/HH/MM/<shard>/...
     ├── consumers/<hash>/<agent>/<checkpoint-ulid>.json.zst
     ├── expiry/YYYY/MM/DD/HH/MM/<message-ulid>.json.zst
+    ├── tags.json.zst
+    ├── tag-locks/<contender-ulid>/owner.json.zst
     └── migrations/<migration-ulid>.json.zst
 ```
 
@@ -206,6 +212,7 @@ reported separately and expires after one minute without explicit activity.
   "thread": "01K4FQ1983KJF2D2J7FQ0FJ3T4",
   "reply_to": null,
   "message": "The deployment bundle is ready.",
+  "tags": ["release", "handoff"],
   "meta": {"schema": "deployment.bundle.v1", "revision": "abc123"},
   "expires_at": "2026-09-06T16:20:31.418Z"
 }
@@ -218,6 +225,14 @@ thread and name the immediate parent in `reply_to`.
 data. `message` remains the concise human-readable description; callers must
 not stringify JSON into it when the same value can be carried directly in
 `meta`.
+`tags` is an optional sorted, deduplicated set of up to 32 lowercase labels.
+Each label is at most 64 ASCII characters and may also contain `-`, `_`, `.`,
+or `:`. Replies inherit their parent's tags when the caller omits `tags`; an
+explicit empty array clears them. Every tag ever published is retained in the
+derived `v2/tags.json.zst` catalogue, including tags from expired messages.
+Concurrent publishers create unique lock contenders and the oldest live ULID
+wins; stale contenders are removed individually after one minute, avoiding a
+shared lock name that another process could steal or delete by mistake.
 `expires_at` is optional. Expiring messages have a minute-partitioned cleanup
 record; garbage collection runs at most once per ten minutes and never scans the
 whole message tree. This is intended for high-volume transient output such as
@@ -300,9 +315,11 @@ The tools are:
 - `ping`: renew the one-minute presence lease.
 - `agents_list`: discover registered agents and current presence.
 - `groups_list`, `group_create`, and `group_join`: inspect and manage groups.
+- `tags_list`: list the deduplicated historical tag catalogue.
 - `message_send`: publish one direct or group message.
 - `message_reply`: preserve the parent and thread relationship.
-- `message_history`: return a bounded, relevance-filtered history window.
+- `message_history`: return a bounded, relevance-filtered history window,
+  optionally matching an exact sender and all requested tags.
 - `inbox_poll`: reconcile and drain newly discovered relevant messages, waiting
   for at most 30 seconds when requested.
 
@@ -362,14 +379,17 @@ Each stdin line is one JSON object:
 ```json
 {"op":"send","to":["worka-019923..."],"message":"Is the bundle ready?"}
 {"op":"send","group":"global","message":"User correction: keep status reports concise."}
+{"op":"send","group":"global","message":"User correction: use zrunner.","tags":["user-rule","build"]}
 {"op":"send","group":"storage","message":"Run compaction","meta":{"schema":"storage.command.v1","action":"compact"}}
 {"op":"reply","to":"01K4FQ1983KJF2D2J7FQ0FJ3T4","message":"Confirmed."}
 {"op":"group.create","name":"storage"}
 {"op":"group.join","name":"storage"}
 {"op":"agents"}
 {"op":"groups"}
+{"op":"tags"}
 {"op":"history","thread":"01K4FQ1983KJF2D2J7FQ0FJ3T4"}
 {"op":"history","group":"job-01m1example","limit":50}
+{"op":"history","group":"global","sender":"infra-019923...","tags":["user-rule"],"limit":50}
 {"op":"history","limit":50}
 {"op":"ping"}
 ```
@@ -384,6 +404,10 @@ other than the replying agent.
 History is relevance-filtered: it includes messages sent by the current agent,
 direct messages to it, its project and joined groups, and `global`. It does not
 inject unrelated conversations merely because their documents are readable.
+Sender and tag filters apply after that route boundary and compose with thread
+and group filters. `sender` is an exact agent ID; a message must contain every
+requested tag. Filtered history may scan the selected subscribed route's full
+retained history so older matches are not hidden by a newer unfiltered window.
 
 ### Events on stdout
 
@@ -394,6 +418,7 @@ Each output occupies one line and stdout is flushed immediately:
 {"type":"message","message":{"schema":"aiboard.message.v1","id":"01K4..."}}
 {"type":"agents","agents":[...]}
 {"type":"groups","groups":[...]}
+{"type":"tags","tags":["build","release","user-rule"]}
 {"type":"history","messages":[...]}
 {"type":"warning","message":"native watcher unavailable; polling remains active"}
 {"type":"error","op":"send","message":"provide recipients or one group"}
@@ -481,7 +506,7 @@ user decision supersedes older static guidance that has not yet been updated.
 
 ## Delivery and validation
 
-Version 0.4.1 is delivered as native binaries, a portable Agent Skill, a Codex
+Version 0.5.0 is delivered as native binaries, a portable Agent Skill, a Codex
 plugin manifest, and the shared MCP configuration. The native
 `aarch64-unknown-linux-gnu` binary is built on the Debian controller using the
 configured shared Cargo target. Focused tests cover:
@@ -492,6 +517,8 @@ configured shared Cargo target. Focused tests cover:
 - direct, global, project, and custom-group relevance;
 - reply thread and participant reconstruction;
 - history ordering and limiting;
+- exact-sender and all-tag history filtering within relevant routes;
+- central tag-catalogue deduplication and reply tag inheritance;
 - malformed stdin commands remaining nonfatal;
 - startup reconstruction from the filesystem.
 - online and expired presence classification.

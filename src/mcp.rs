@@ -16,7 +16,8 @@ use crate::model::{Agent, AgentStatus, Message};
 use crate::storage::{
     BoardState, MessageDraft, acknowledge_messages, agent_statuses, create_group,
     direct_reply_recipients, ensure_layout, group_members, initialize_routing, join_group,
-    message_is_relevant, publish_message, register_agent, relevant_history, scan, touch_presence,
+    message_is_relevant, normalize_tags, publish_message, register_agent, relevant_history, scan,
+    touch_presence,
 };
 
 pub struct McpOptions {
@@ -48,6 +49,8 @@ struct SendInput {
     to: Vec<String>,
     group: Option<String>,
     message: String,
+    #[serde(default)]
+    tags: Vec<String>,
     meta: Option<Value>,
     ttl_seconds: Option<u64>,
 }
@@ -56,6 +59,7 @@ struct SendInput {
 struct ReplyInput {
     message_id: String,
     message: String,
+    tags: Option<Vec<String>>,
     meta: Option<Value>,
     ttl_seconds: Option<u64>,
 }
@@ -69,6 +73,9 @@ struct GroupInput {
 struct HistoryInput {
     thread: Option<String>,
     group: Option<String>,
+    sender: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
     limit: Option<usize>,
 }
 
@@ -98,6 +105,11 @@ struct GroupOutput {
 #[derive(Debug, JsonSchema, Serialize)]
 struct GroupsOutput {
     groups: Vec<GroupOutput>,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+struct TagsOutput {
+    tags: Vec<String>,
 }
 
 #[derive(Debug, JsonSchema, Serialize)]
@@ -274,6 +286,22 @@ impl ZboardServer {
     }
 
     #[tool(
+        name = "tags_list",
+        description = "List every tag historically used on this board"
+    )]
+    fn tags_list(&self) -> Result<Json<TagsOutput>, String> {
+        let mut inner = self.lock()?;
+        self.touch(&mut inner)?;
+        crate::routed::tags(
+            self.version_root
+                .parent()
+                .ok_or_else(|| "v1 has no board root".to_owned())?,
+        )
+        .map(|tags| Json(TagsOutput { tags }))
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    #[tool(
         name = "group_create",
         description = "Create an idempotent collaboration group"
     )]
@@ -348,6 +376,7 @@ impl ZboardServer {
                 thread: None,
                 reply_to: None,
                 body: input.message,
+                tags: input.tags,
                 meta: input.meta,
                 ttl_seconds: input.ttl_seconds,
             },
@@ -401,6 +430,7 @@ impl ZboardServer {
                 thread: Some(parent.thread),
                 reply_to: Some(parent.id),
                 body: input.message,
+                tags: input.tags.unwrap_or(parent.tags),
                 meta: input.meta,
                 ttl_seconds: input.ttl_seconds,
             },
@@ -431,13 +461,18 @@ impl ZboardServer {
         self.touch(&mut inner)?;
         let mut warnings = self.refresh(&mut inner);
         let limit = input.limit.unwrap_or(50).min(1_000);
+        let tags = normalize_tags(input.tags).map_err(|error| format!("{error:#}"))?;
         let (messages, history_warnings) = relevant_history(
             &self.version_root,
             &inner.board,
             &self.agent,
-            input.thread.as_deref(),
-            input.group.as_deref(),
-            limit,
+            crate::routed::HistoryFilter {
+                thread: input.thread.as_deref(),
+                group: input.group.as_deref(),
+                sender: input.sender.as_deref(),
+                tags: &tags,
+                limit,
+            },
         );
         warnings.extend(history_warnings);
         Ok(Json(MessagesOutput { messages, warnings }))
@@ -537,6 +572,7 @@ mod tests {
                 to: vec![recipient.agent.id.clone()],
                 group: None,
                 message: "handoff".to_owned(),
+                tags: vec!["release".to_owned()],
                 meta: Some(serde_json::json!({"schema":"example.v1","count":2})),
                 ttl_seconds: None,
             }))
@@ -551,6 +587,11 @@ mod tests {
             Some(serde_json::json!({"schema":"example.v1","count":2}))
         );
         assert_eq!(received.from, sender.agent.id);
+        assert_eq!(received.tags, vec!["release"]);
+        assert_eq!(
+            sender.tags_list().unwrap().0.tags,
+            vec!["release".to_owned()]
+        );
     }
 
     #[test]
@@ -565,6 +606,7 @@ mod tests {
             to: Vec::new(),
             group: Some("release".to_owned()),
             message: "ready".to_owned(),
+            tags: Vec::new(),
             meta: None,
             ttl_seconds: None,
         };
@@ -585,6 +627,7 @@ mod tests {
                 to: vec![recipient_id],
                 group: None,
                 message: "while offline".to_owned(),
+                tags: Vec::new(),
                 meta: None,
                 ttl_seconds: None,
             }))
@@ -615,6 +658,7 @@ mod tests {
                     to: vec![recipient_id],
                     group: None,
                     message: "at least once".to_owned(),
+                    tags: Vec::new(),
                     meta: None,
                     ttl_seconds: None,
                 }))

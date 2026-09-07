@@ -33,6 +33,8 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,6 +83,8 @@ pub enum Command {
         group: Option<String>,
         message: String,
         #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
         meta: Option<Value>,
         ttl_seconds: Option<u64>,
     },
@@ -88,6 +92,7 @@ pub enum Command {
     Reply {
         to: String,
         message: String,
+        tags: Option<Vec<String>>,
         #[serde(default)]
         meta: Option<Value>,
         ttl_seconds: Option<u64>,
@@ -100,10 +105,15 @@ pub enum Command {
     Agents,
     #[serde(rename = "groups")]
     Groups,
+    #[serde(rename = "tags")]
+    Tags,
     #[serde(rename = "history")]
     History {
         thread: Option<String>,
         group: Option<String>,
+        sender: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
         limit: Option<usize>,
     },
     #[serde(rename = "ping")]
@@ -126,6 +136,8 @@ pub enum Output<'a> {
     Agents { agents: Vec<AgentStatus> },
     #[serde(rename = "groups")]
     Groups { groups: Vec<GroupSummary<'a>> },
+    #[serde(rename = "tags")]
+    Tags { tags: &'a [String] },
     #[serde(rename = "history")]
     History { messages: Vec<&'a Message> },
     #[serde(rename = "group.created")]

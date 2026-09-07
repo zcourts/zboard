@@ -13,7 +13,8 @@ use crate::model::{Command, GroupSummary, Output};
 use crate::storage::{
     BoardState, MessageDraft, acknowledge_messages, agent_statuses, create_group,
     direct_reply_recipients, ensure_layout, group_members, initialize_routing, join_group,
-    message_is_relevant, publish_message, register_agent, relevant_history, scan, touch_presence,
+    message_is_relevant, normalize_tags, publish_message, register_agent, relevant_history, scan,
+    touch_presence,
 };
 
 pub struct RunOptions {
@@ -180,6 +181,7 @@ fn handle_command(
             to,
             group,
             message,
+            tags,
             meta,
             ttl_seconds,
         } => {
@@ -197,6 +199,7 @@ fn handle_command(
                     thread: None,
                     reply_to: None,
                     body: message,
+                    tags,
                     meta,
                     ttl_seconds,
                 },
@@ -208,6 +211,7 @@ fn handle_command(
         Command::Reply {
             to,
             message,
+            tags,
             meta,
             ttl_seconds,
         } => {
@@ -234,6 +238,7 @@ fn handle_command(
                     thread: Some(parent.thread),
                     reply_to: Some(parent.id),
                     body: message,
+                    tags: tags.unwrap_or(parent.tags),
                     meta,
                     ttl_seconds,
                 },
@@ -274,19 +279,30 @@ fn handle_command(
                 .collect();
             emit(output, &Output::Groups { groups })?;
         }
+        Command::Tags => {
+            let tags = crate::routed::tags(version_root.parent().expect("v1 has a board root"))?;
+            emit(output, &Output::Tags { tags: &tags })?;
+        }
         Command::History {
             thread,
             group,
+            sender,
+            tags,
             limit,
         } => {
+            let tags = normalize_tags(tags)?;
             let limit = limit.unwrap_or(50).min(1_000);
             let (messages, warnings) = relevant_history(
                 version_root,
                 state,
                 agent,
-                thread.as_deref(),
-                group.as_deref(),
-                limit,
+                crate::routed::HistoryFilter {
+                    thread: thread.as_deref(),
+                    group: group.as_deref(),
+                    sender: sender.as_deref(),
+                    tags: &tags,
+                    limit,
+                },
             );
             for warning in warnings {
                 emit(output, &Output::Warning { message: &warning })?;
@@ -440,6 +456,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::GroupJoin { .. } => "group.join",
         Command::Agents => "agents",
         Command::Groups => "groups",
+        Command::Tags => "tags",
         Command::History { .. } => "history",
         Command::Ping => "ping",
     }
@@ -521,6 +538,7 @@ mod tests {
                 thread: None,
                 reply_to: None,
                 body: "question".to_owned(),
+                tags: vec!["handoff".to_owned()],
                 meta: None,
                 ttl_seconds: None,
             },
@@ -536,6 +554,7 @@ mod tests {
             Command::Reply {
                 to: parent.id.clone(),
                 message: "answer".to_owned(),
+                tags: None,
                 meta: None,
                 ttl_seconds: None,
             },
@@ -546,6 +565,7 @@ mod tests {
         assert_eq!(reply.thread, parent.thread);
         assert_eq!(reply.reply_to.as_deref(), Some(parent.id.as_str()));
         assert_eq!(reply.to, vec![other.id]);
+        assert_eq!(reply.tags, vec!["handoff"]);
     }
 
     #[test]
@@ -563,6 +583,7 @@ mod tests {
                     thread: None,
                     reply_to: None,
                     body: body.to_owned(),
+                    tags: Vec::new(),
                     meta: None,
                     ttl_seconds: None,
                 },
@@ -578,6 +599,8 @@ mod tests {
             Command::History {
                 thread: None,
                 group: None,
+                sender: None,
+                tags: Vec::new(),
                 limit: Some(2),
             },
             &mut output,
@@ -606,6 +629,7 @@ mod tests {
                     thread: None,
                     reply_to: None,
                     body: body.to_owned(),
+                    tags: Vec::new(),
                     meta: None,
                     ttl_seconds: None,
                 },
@@ -622,6 +646,8 @@ mod tests {
             Command::History {
                 thread: None,
                 group: None,
+                sender: None,
+                tags: Vec::new(),
                 limit: None,
             },
             &mut output,

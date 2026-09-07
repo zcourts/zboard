@@ -67,3 +67,49 @@ fn jsonl_restart_emits_message_received_while_offline() {
     assert_eq!(delivered["message"]["message"], "while offline");
     stop(resumed);
 }
+
+#[test]
+fn jsonl_lists_tags_and_filters_history_by_sender_and_tags() {
+    let root = TempDir::new().unwrap();
+    let (mut agent, mut output) = start(&root, "infra", "one");
+    let ready = next_event(&mut output);
+    let sender = ready["agent"].as_str().unwrap().to_owned();
+    for command in [
+        json!({
+            "op":"send",
+            "group":"global",
+            "message":"important rule",
+            "tags":["user-rule","build"]
+        }),
+        json!({"op":"send","group":"global","message":"ordinary noise"}),
+    ] {
+        writeln!(agent.stdin.as_mut().unwrap(), "{command}").unwrap();
+        agent.stdin.as_mut().unwrap().flush().unwrap();
+        assert_eq!(next_event(&mut output)["type"], "sent");
+    }
+
+    writeln!(agent.stdin.as_mut().unwrap(), "{}", json!({"op":"tags"})).unwrap();
+    agent.stdin.as_mut().unwrap().flush().unwrap();
+    let tags = next_event(&mut output);
+    assert_eq!(tags["type"], "tags");
+    assert_eq!(tags["tags"], json!(["build", "user-rule"]));
+
+    writeln!(
+        agent.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "op":"history",
+            "group":"global",
+            "sender":sender,
+            "tags":["user-rule"],
+            "limit":50
+        })
+    )
+    .unwrap();
+    agent.stdin.as_mut().unwrap().flush().unwrap();
+    let history = next_event(&mut output);
+    assert_eq!(history["type"], "history");
+    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(history["messages"][0]["message"], "important rule");
+    stop(agent);
+}

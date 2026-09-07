@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Timelike, Utc};
@@ -15,6 +15,7 @@ const DOCUMENT_SUFFIX: &str = ".json.zst";
 const CHECKPOINT_SCHEMA: &str = "aiboard.consumer.v1";
 const EXPIRY_SCHEMA: &str = "aiboard.expiry.v1";
 const MIGRATION_SCHEMA: &str = "aiboard.migration.v1";
+const TAG_CATALOG_SCHEMA: &str = "aiboard.tag-catalog.v1";
 const CACHE_LIMIT: usize = 4096;
 const RECENT_MINUTES: i64 = 10;
 
@@ -52,12 +53,59 @@ struct Expiry {
     paths: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct TagCatalog {
+    schema: String,
+    tags: Vec<String>,
+    updated_at: String,
+}
+
+struct TagCatalogLock {
+    path: PathBuf,
+    owner: String,
+}
+
+impl TagCatalogLock {
+    fn ensure_owned(&self) -> Result<()> {
+        let owner: TagCatalogLockOwner = read_document(&self.path.join("owner.json.zst"))?;
+        if owner.id != self.owner {
+            bail!("tag catalogue lock ownership was lost");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TagCatalogLock {
+    fn drop(&mut self) {
+        let owner_path = self.path.join("owner.json.zst");
+        let owned = read_document::<TagCatalogLockOwner>(&owner_path)
+            .is_ok_and(|owner| owner.id == self.owner);
+        if owned {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TagCatalogLockOwner {
+    id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MigrationReport {
     schema: String,
     migrated: usize,
     already_present: usize,
     retained_legacy: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct HistoryFilter<'a> {
+    pub thread: Option<&'a str>,
+    pub group: Option<&'a str>,
+    pub sender: Option<&'a str>,
+    pub tags: &'a [String],
+    pub limit: usize,
 }
 
 pub fn ensure(root: &Path) -> Result<PathBuf> {
@@ -69,6 +117,7 @@ pub fn ensure(root: &Path) -> Result<PathBuf> {
         v2.join("messages/direct"),
         v2.join("consumers"),
         v2.join("expiry"),
+        v2.join("tag-locks"),
         v2.join("migrations"),
     ] {
         fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
@@ -94,6 +143,7 @@ pub fn initialize(root: &Path, state: &mut RoutedState, agent: &Agent) -> Result
 }
 
 pub fn publish(root: &Path, message: &Message) -> Result<Vec<PathBuf>> {
+    update_tag_catalog(root, &message.tags)?;
     let mut routes = message_routes(message);
     routes.sort();
     routes.dedup();
@@ -241,10 +291,15 @@ pub fn history(
     root: &Path,
     agent: &Agent,
     groups: impl Iterator<Item = String>,
-    thread: Option<&str>,
-    group: Option<&str>,
-    limit: usize,
+    filter: HistoryFilter<'_>,
 ) -> (Vec<Message>, Vec<String>) {
+    let HistoryFilter {
+        thread,
+        group,
+        sender,
+        tags,
+        limit,
+    } = filter;
     let mut routes = vec![
         "global".to_owned(),
         format!("project:{}", agent.project),
@@ -262,7 +317,7 @@ pub fn history(
     let mut paths = Vec::new();
     for route in routes {
         let route_root = route_directory(root, &route);
-        let route_paths = if thread.is_some() {
+        let route_paths = if thread.is_some() || sender.is_some() || !tags.is_empty() {
             document_files_recursive(&route_root)
         } else {
             newest_paths(&route_root, limit)
@@ -277,6 +332,8 @@ pub fn history(
             Ok(message)
                 if !is_expired(&message)
                     && thread.is_none_or(|thread| message.thread == thread)
+                    && sender.is_none_or(|sender| message.from == sender)
+                    && tags.iter().all(|tag| message.tags.contains(tag))
                     && seen.insert(message.id.clone()) =>
             {
                 messages.push(message);
@@ -290,6 +347,90 @@ pub fn history(
         messages.drain(..messages.len() - limit);
     }
     (messages, warnings)
+}
+
+pub fn tags(root: &Path) -> Result<Vec<String>> {
+    let path = root.join("v2/tags.json.zst");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let catalog: TagCatalog = read_document(&path)?;
+    if catalog.schema != TAG_CATALOG_SCHEMA {
+        bail!("unsupported tag catalogue schema");
+    }
+    Ok(catalog.tags)
+}
+
+fn update_tag_catalog(root: &Path, new_tags: &[String]) -> Result<()> {
+    if new_tags.is_empty() {
+        return Ok(());
+    }
+    let lock = acquire_tag_catalog_lock(root)?;
+    let path = root.join("v2/tags.json.zst");
+    let mut catalog = if path.exists() {
+        let catalog: TagCatalog = read_document(&path)?;
+        if catalog.schema != TAG_CATALOG_SCHEMA {
+            bail!("unsupported tag catalogue schema");
+        }
+        catalog
+    } else {
+        TagCatalog {
+            schema: TAG_CATALOG_SCHEMA.to_owned(),
+            tags: Vec::new(),
+            updated_at: now(),
+        }
+    };
+    catalog.tags.extend_from_slice(new_tags);
+    catalog.tags.sort();
+    catalog.tags.dedup();
+    catalog.updated_at = now();
+    lock.ensure_owned()?;
+    write_document(&path, &catalog)
+}
+
+fn acquire_tag_catalog_lock(root: &Path) -> Result<TagCatalogLock> {
+    let locks = root.join("v2/tag-locks");
+    fs::create_dir_all(&locks).context("create tag catalogue lock directory")?;
+    let owner = Ulid::new().to_string();
+    let path = locks.join(&owner);
+    fs::create_dir(&path).context("create tag catalogue lock contender")?;
+    if let Err(error) = write_document(
+        &path.join("owner.json.zst"),
+        &TagCatalogLockOwner { id: owner.clone() },
+    ) {
+        let _ = fs::remove_dir_all(&path);
+        return Err(error).context("write tag catalogue lock owner");
+    }
+    let lock = TagCatalogLock { path, owner };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut contenders = Vec::new();
+        for entry in fs::read_dir(&locks).context("read tag catalogue lock contenders")? {
+            let entry = entry.context("read tag catalogue lock contender")?;
+            let contender = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let stale = fs::metadata(contender.join("owner.json.zst"))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age >= Duration::from_secs(60));
+            if contender != lock.path && stale {
+                let _ = fs::remove_dir_all(&contender);
+            } else {
+                contenders.push(contender);
+            }
+        }
+        contenders.sort();
+        if contenders.first() == Some(&lock.path) {
+            return Ok(lock);
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for the tag catalogue lock");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 pub fn migrate_v1(root: &Path) -> Result<MigrationReport> {
@@ -680,6 +821,7 @@ mod tests {
             thread: id,
             reply_to: None,
             message: "hello".to_owned(),
+            tags: Vec::new(),
             meta: None,
             expires_at: None,
         }
@@ -723,13 +865,102 @@ mod tests {
             root.path(),
             &agent(),
             ["job-selected".to_owned(), "job-unrelated".to_owned()].into_iter(),
-            None,
-            Some("job-selected"),
-            50,
+            HistoryFilter {
+                thread: None,
+                group: Some("job-selected"),
+                sender: None,
+                tags: &[],
+                limit: 50,
+            },
         );
 
         assert!(warnings.is_empty());
         assert_eq!(messages, vec![selected]);
+    }
+
+    #[test]
+    fn history_filters_by_sender_and_all_requested_tags() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let mut selected = message(Ulid::new().to_string());
+        selected.tags = vec!["release".to_owned(), "user-rule".to_owned()];
+        publish(root.path(), &selected).unwrap();
+        let mut wrong_sender = message(Ulid::new().to_string());
+        wrong_sender.from = "keldra-one".to_owned();
+        wrong_sender.tags = selected.tags.clone();
+        publish(root.path(), &wrong_sender).unwrap();
+        let mut missing_tag = message(Ulid::new().to_string());
+        missing_tag.tags = vec!["release".to_owned()];
+        publish(root.path(), &missing_tag).unwrap();
+
+        let (messages, warnings) = history(
+            root.path(),
+            &agent(),
+            std::iter::empty(),
+            HistoryFilter {
+                thread: None,
+                group: None,
+                sender: Some("worka-one"),
+                tags: &["release".to_owned(), "user-rule".to_owned()],
+                limit: 50,
+            },
+        );
+
+        assert!(warnings.is_empty());
+        assert_eq!(messages, vec![selected]);
+    }
+
+    #[test]
+    fn tag_catalogue_is_central_deduplicated_and_historical() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let mut first = message(Ulid::new().to_string());
+        first.tags = vec!["user-rule".to_owned(), "release".to_owned()];
+        publish(root.path(), &first).unwrap();
+        let mut second = message(Ulid::new().to_string());
+        second.tags = vec!["release".to_owned(), "security".to_owned()];
+        second.expires_at = Some(
+            (Utc::now() - chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        publish(root.path(), &second).unwrap();
+        collect_expired(root.path()).unwrap();
+
+        assert_eq!(
+            tags(root.path()).unwrap(),
+            vec![
+                "release".to_owned(),
+                "security".to_owned(),
+                "user-rule".to_owned()
+            ]
+        );
+        assert!(root.path().join("v2/tags.json.zst").is_file());
+    }
+
+    #[test]
+    fn concurrent_publishers_do_not_lose_catalogue_tags() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let handles = (0..8)
+            .map(|index| {
+                let root = root.path().to_owned();
+                std::thread::spawn(move || {
+                    let mut item = message(Ulid::new().to_string());
+                    item.tags = vec![format!("tag-{index}")];
+                    publish(&root, &item).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            tags(root.path()).unwrap(),
+            (0..8)
+                .map(|index| format!("tag-{index}"))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

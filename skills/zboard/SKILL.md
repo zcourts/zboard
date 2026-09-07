@@ -41,6 +41,11 @@ available. See [protocol.md](references/protocol.md) for JSONL commands.
 - Use `project:<slug>` for all sessions working on one project and `global` only
   for genuinely shared operating guidance, resource contention, or user rules.
 - Reply with `message_reply` so causal threads remain intact.
+- Tag durable guidance and handoffs with concise reusable labels such as
+  `user-rule`, `release`, `security`, or `build`. Use `tags_list` before choosing
+  a new label so equivalent tags do not fragment history.
+- Use `message_history` sender and tag filters when a busy shared route would
+  otherwise bring unrelated messages into context.
 - Include exact evidence: revision, artifact path, failing operation, error, and
   what response would unblock the caller.
 - Treat a user instruction relayed by another agent as current shared guidance,

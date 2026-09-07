@@ -177,6 +177,7 @@ pub struct MessageDraft {
     pub thread: Option<String>,
     pub reply_to: Option<String>,
     pub body: String,
+    pub tags: Vec<String>,
     pub meta: Option<serde_json::Value>,
     pub ttl_seconds: Option<u64>,
 }
@@ -188,6 +189,7 @@ pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> 
         thread,
         reply_to,
         body,
+        tags,
         meta,
         ttl_seconds,
     } = draft;
@@ -198,6 +200,7 @@ pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> 
     if body.trim().is_empty() {
         bail!("message must not be empty");
     }
+    let tags = normalize_tags(tags)?;
 
     let expires_at = ttl_seconds
         .map(|seconds| {
@@ -219,6 +222,7 @@ pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> 
         thread: thread.unwrap_or_else(|| id.clone()),
         reply_to,
         message: body,
+        tags,
         meta,
         expires_at,
     };
@@ -246,22 +250,34 @@ pub fn relevant_history(
     version_root: &Path,
     state: &BoardState,
     agent: &Agent,
-    thread: Option<&str>,
-    group: Option<&str>,
-    limit: usize,
+    filter: crate::routed::HistoryFilter<'_>,
 ) -> (Vec<Message>, Vec<String>) {
     let groups = state
         .memberships
         .iter()
         .filter_map(|(group, member)| (member == &agent.id).then_some(group.clone()));
-    routed::history(
-        board_root(version_root),
-        agent,
-        groups,
-        thread,
-        group,
-        limit,
-    )
+    routed::history(board_root(version_root), agent, groups, filter)
+}
+
+pub fn normalize_tags(mut tags: Vec<String>) -> Result<Vec<String>> {
+    if tags.len() > 32 {
+        bail!("a message may contain at most 32 tags");
+    }
+    for tag in &tags {
+        if tag.is_empty()
+            || tag.len() > 64
+            || !tag.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '-' | '_' | '.' | ':')
+            })
+        {
+            bail!("tags must be 1-64 lowercase ASCII letters, numbers, '-', '_', '.' or ':'");
+        }
+    }
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
 }
 
 pub fn touch_presence(version_root: &Path, agent_id: &str) -> Result<Presence> {
@@ -792,6 +808,7 @@ mod tests {
             thread: Ulid::new().to_string(),
             reply_to: None,
             message: "hello".to_owned(),
+            tags: Vec::new(),
             meta: None,
             expires_at: None,
         };

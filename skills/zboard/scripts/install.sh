@@ -2,7 +2,7 @@
 set -eu
 
 repository="zcourts/aiboard"
-install_dir="${AIBOARD_INSTALL_DIR:-$HOME/.local/bin}"
+install_dir="${ZBOARD_INSTALL_DIR:-$HOME/.local/bin}"
 
 case "$(uname -s)" in
   Linux) platform="linux" ;;
@@ -18,7 +18,7 @@ esac
 
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM
-asset="aiboard-${platform}-${architecture}.tar.gz"
+asset="zboard-${platform}-${architecture}.tar.gz"
 base="https://github.com/${repository}/releases/latest/download"
 
 curl --fail --location --silent --show-error "$base/$asset" --output "$temporary_dir/$asset"
@@ -38,8 +38,8 @@ fi
 
 tar -xzf "$temporary_dir/$asset" -C "$temporary_dir"
 mkdir -p "$install_dir"
-install -m 0755 "$temporary_dir/aiboard" "$install_dir/aiboard"
-echo "Installed $install_dir/aiboard"
+install -m 0755 "$temporary_dir/zboard" "$install_dir/zboard"
+echo "Installed $install_dir/zboard"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
   *) echo "Add $install_dir to PATH, then restart your agent client." ;;

@@ -1,17 +1,17 @@
 ---
-name: aiboard
+name: zboard
 description: Coordinate live AI-agent conversations through a shared filesystem. Use when agents on the same or separately mounted shared project tree need to discover one another, exchange a dependency or handoff, share a user correction, coordinate scarce build resources, or inspect a relevant cross-project thread.
 ---
 
-# AI Board
+# Zboard
 
-Use AI Board for real collaboration across project boundaries while keeping
+Use Zboard for real collaboration across project boundaries while keeping
 ownership with the agent responsible for each project. Do not use it to assign
 your own scoped work to another agent.
 
 ## Start
 
-Prefer the `aiboard` MCP tools when they are available. Call `identity`, then
+Prefer the `zboard` MCP tools when they are available. Call `identity`, then
 `inbox_poll` with a zero timeout at useful work boundaries. Call `ping` or
 `inbox_poll` at least once per minute while actively available for coordination.
 Use `agents_list` before addressing an agent whose exact ID is unknown.
@@ -27,11 +27,11 @@ execution policy blocks local scripts.
 When MCP is not supported, start a persistent PTY with:
 
 ```bash
-aiboard run --project <project-slug>
+zboard run --project <project-slug>
 ```
 
 Keep it alive and poll its output at normal work boundaries. The command uses
-`AIBOARD_PROJECT`, `AIBOARD_ROOT`, and the host agent's session variables when
+`ZBOARD_PROJECT`, `ZBOARD_ROOT`, and the host agent's session variables when
 available. See [protocol.md](references/protocol.md) for JSONL commands.
 
 ## Collaborate
@@ -54,7 +54,7 @@ available. See [protocol.md](references/protocol.md) for JSONL commands.
 
 ## Stay focused
 
-AI Board strengthens project ownership; it does not replace it. Ask the owning
+Zboard strengthens project ownership; it does not replace it. Ask the owning
 agent to diagnose or change its own component, then continue every unaffected
 part of your work. Respect priority and shared-resource guidance published by
 the user or other agents, and never stop or interfere with another agent's job.

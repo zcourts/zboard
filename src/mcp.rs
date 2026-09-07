@@ -10,6 +10,7 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
 use rmcp::{Json, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::model::{Agent, AgentStatus, Message};
 use crate::storage::{
@@ -32,7 +33,7 @@ struct Inner {
 }
 
 #[derive(Clone)]
-pub struct AiboardServer {
+pub struct ZboardServer {
     version_root: PathBuf,
     agent: Agent,
     poll_interval: Duration,
@@ -46,6 +47,7 @@ struct SendInput {
     to: Vec<String>,
     group: Option<String>,
     message: String,
+    meta: Option<Value>,
     ttl_seconds: Option<u64>,
 }
 
@@ -53,6 +55,7 @@ struct SendInput {
 struct ReplyInput {
     message_id: String,
     message: String,
+    meta: Option<Value>,
     ttl_seconds: Option<u64>,
 }
 
@@ -64,6 +67,7 @@ struct GroupInput {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct HistoryInput {
     thread: Option<String>,
+    group: Option<String>,
     limit: Option<usize>,
 }
 
@@ -106,7 +110,7 @@ struct MessagesOutput {
     warnings: Vec<String>,
 }
 
-impl AiboardServer {
+impl ZboardServer {
     fn new(options: McpOptions) -> Result<Self> {
         let version_root = ensure_layout(&options.root)?;
         let agent = register_agent(
@@ -128,7 +132,7 @@ impl AiboardServer {
         acknowledge_messages(&version_root, &mut board, &initial_messages)?;
         if !initial.warnings.is_empty() {
             eprintln!(
-                "aiboard: initial scan warnings: {}",
+                "zboard: initial scan warnings: {}",
                 initial.warnings.join("; ")
             );
         }
@@ -147,7 +151,7 @@ impl AiboardServer {
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, String> {
         self.inner
             .lock()
-            .map_err(|_| "AI Board state lock is poisoned".to_owned())
+            .map_err(|_| "Zboard state lock is poisoned".to_owned())
     }
 
     fn refresh(&self, inner: &mut Inner) -> Vec<String> {
@@ -199,10 +203,10 @@ impl AiboardServer {
 }
 
 #[tool_router]
-impl AiboardServer {
+impl ZboardServer {
     #[tool(
         name = "identity",
-        description = "Return this AI Board agent's registered identity"
+        description = "Return this Zboard agent's registered identity"
     )]
     fn identity(&self) -> Result<Json<IdentityOutput>, String> {
         let mut inner = self.lock()?;
@@ -332,6 +336,7 @@ impl AiboardServer {
                 thread: None,
                 reply_to: None,
                 body: input.message,
+                meta: input.meta,
                 ttl_seconds: input.ttl_seconds,
             },
         )
@@ -384,6 +389,7 @@ impl AiboardServer {
                 thread: Some(parent.thread),
                 reply_to: Some(parent.id),
                 body: input.message,
+                meta: input.meta,
                 ttl_seconds: input.ttl_seconds,
             },
         )
@@ -403,7 +409,7 @@ impl AiboardServer {
 
     #[tool(
         name = "message_history",
-        description = "Read relevant messages, optionally from one thread, newest window last"
+        description = "Read relevant messages, optionally from one thread or joined group, newest window last"
     )]
     fn message_history(
         &self,
@@ -418,6 +424,7 @@ impl AiboardServer {
             &inner.board,
             &self.agent,
             input.thread.as_deref(),
+            input.group.as_deref(),
             limit,
         );
         warnings.extend(history_warnings);
@@ -459,11 +466,11 @@ impl AiboardServer {
 }
 
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for AiboardServer {
+impl ServerHandler for ZboardServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
-        info.server_info = Implementation::new("aiboard", env!("CARGO_PKG_VERSION"))
-            .with_title("AI Board")
+        info.server_info = Implementation::new("zboard", env!("CARGO_PKG_VERSION"))
+            .with_title("Zboard")
             .with_description("Shared-filesystem coordination for AI-agent conversations")
             .with_website_url("https://github.com/zcourts/aiboard");
         info.instructions = Some(format!(
@@ -475,7 +482,7 @@ impl ServerHandler for AiboardServer {
 }
 
 pub async fn serve(options: McpOptions) -> Result<()> {
-    let server = AiboardServer::new(options)?;
+    let server = ZboardServer::new(options)?;
     let service = server
         .serve(rmcp::transport::stdio())
         .await
@@ -503,15 +510,16 @@ mod tests {
     fn direct_message_reaches_recipient_inbox() {
         let directory = tempdir().unwrap();
         let sender =
-            AiboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
+            ZboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
         let recipient =
-            AiboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
+            ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
 
         sender
             .message_send(Parameters(SendInput {
                 to: vec![recipient.agent.id.clone()],
                 group: None,
                 message: "handoff".to_owned(),
+                meta: Some(serde_json::json!({"schema":"example.v1","count":2})),
                 ttl_seconds: None,
             }))
             .unwrap();
@@ -520,6 +528,10 @@ mod tests {
         assert!(recipient.refresh(&mut inner).is_empty());
         let received = inner.inbox.pop_front().unwrap();
         assert_eq!(received.message, "handoff");
+        assert_eq!(
+            received.meta,
+            Some(serde_json::json!({"schema":"example.v1","count":2}))
+        );
         assert_eq!(received.from, sender.agent.id);
     }
 
@@ -527,7 +539,7 @@ mod tests {
     fn group_send_requires_membership() {
         let directory = tempdir().unwrap();
         let server =
-            AiboardServer::new(options(directory.path().to_owned(), "infra", "one")).unwrap();
+            ZboardServer::new(options(directory.path().to_owned(), "infra", "one")).unwrap();
         let mut inner = server.lock().unwrap();
         let group = create_group(&server.version_root, "release", &server.agent.id).unwrap();
         inner.board.groups.insert(group.name.clone(), group);
@@ -535,6 +547,7 @@ mod tests {
             to: Vec::new(),
             group: Some("release".to_owned()),
             message: "ready".to_owned(),
+            meta: None,
             ttl_seconds: None,
         };
         assert!(server.validate_send(&inner.board, &input).is_err());

@@ -1,6 +1,6 @@
 {
-  "name": "aiboard",
-  "version": "0.2.0",
+  "name": "zboard",
+  "version": "0.4.0",
   "description": "Coordinate live AI-agent conversations through a shared filesystem.",
   "author": {
     "name": "zcourts",
@@ -13,13 +13,13 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "AI Board",
+    "displayName": "Zboard",
     "shortDescription": "Coordinate agents through a shared folder.",
     "longDescription": "Discover and coordinate live Codex, Claude, and other agent sessions across machines without operating a server.",
     "developerName": "zcourts",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],
     "websiteURL": "https://github.com/zcourts/aiboard",
-    "defaultPrompt": "Check AI Board for relevant messages and coordinate any real cross-agent dependency."
+    "defaultPrompt": "Check Zboard for relevant messages and coordinate any real cross-agent dependency."
   }
 }

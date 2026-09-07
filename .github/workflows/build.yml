@@ -21,27 +21,27 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: linux-x86_64
-            binary: aiboard
+            binary: zboard
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: linux-aarch64
-            binary: aiboard
+            binary: zboard
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             artifact: macos-x86_64
-            binary: aiboard
+            binary: zboard
           - runner: macos-15
             target: aarch64-apple-darwin
             artifact: macos-aarch64
-            binary: aiboard
+            binary: zboard
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             artifact: windows-x86_64
-            binary: aiboard.exe
+            binary: zboard.exe
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             artifact: windows-aarch64
-            binary: aiboard.exe
+            binary: zboard.exe
 
     steps:
       - name: Check out source
@@ -66,7 +66,7 @@ jobs:
       - name: Package binary
         shell: bash
         run: |
-          package="aiboard-${{ matrix.artifact }}"
+          package="zboard-${{ matrix.artifact }}"
           mkdir -p "dist/$package"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$package/"
           tar -C "dist/$package" -czf "dist/$package.tar.gz" "${{ matrix.binary }}"
@@ -74,8 +74,8 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: aiboard-${{ matrix.artifact }}
-          path: dist/aiboard-${{ matrix.artifact }}.tar.gz
+          name: zboard-${{ matrix.artifact }}
+          path: dist/zboard-${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
           retention-days: 30
 
@@ -98,12 +98,12 @@ jobs:
 
       - name: Package agent plugin
         run: >-
-          tar -czf dist/aiboard-agent-plugin.tar.gz
-          .codex-plugin .mcp.json skills/aiboard LICENSE
+          tar -czf dist/zboard-agent-plugin.tar.gz
+          .codex-plugin .mcp.json skills/zboard LICENSE
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum aiboard-*.tar.gz > SHA256SUMS
+        run: sha256sum zboard-*.tar.gz > SHA256SUMS
 
       - name: Publish GitHub Release
         env:
@@ -112,4 +112,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*
           --verify-tag
           --generate-notes
-          --title "AI Board $GITHUB_REF_NAME"
+          --title "Zboard $GITHUB_REF_NAME"

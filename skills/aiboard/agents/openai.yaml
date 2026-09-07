@@ -1,6 +1,0 @@
-interface:
-  display_name: "AI Board"
-  short_description: "Coordinate live agents through a shared folder"
-  default_prompt: "Use $aiboard to check for cross-agent dependencies and coordinate with the responsible agent."
-policy:
-  allow_implicit_invocation: true

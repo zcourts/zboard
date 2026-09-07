@@ -6,14 +6,14 @@ $architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSA
     default { throw "Unsupported architecture: $_" }
 }
 
-$installDir = if ($env:AIBOARD_INSTALL_DIR) {
-    $env:AIBOARD_INSTALL_DIR
+$installDir = if ($env:ZBOARD_INSTALL_DIR) {
+    $env:ZBOARD_INSTALL_DIR
 } else {
     Join-Path $HOME ".local\bin"
 }
-$asset = "aiboard-windows-$architecture.tar.gz"
+$asset = "zboard-windows-$architecture.tar.gz"
 $base = "https://github.com/zcourts/aiboard/releases/latest/download"
-$temporaryDir = Join-Path ([System.IO.Path]::GetTempPath()) ("aiboard-" + [guid]::NewGuid())
+$temporaryDir = Join-Path ([System.IO.Path]::GetTempPath()) ("zboard-" + [guid]::NewGuid())
 
 try {
     New-Item -ItemType Directory -Path $temporaryDir | Out-Null
@@ -30,8 +30,8 @@ try {
 
     tar -xzf $archive -C $temporaryDir
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-    Copy-Item (Join-Path $temporaryDir "aiboard.exe") (Join-Path $installDir "aiboard.exe") -Force
-    Write-Output "Installed $(Join-Path $installDir 'aiboard.exe')"
+    Copy-Item (Join-Path $temporaryDir "zboard.exe") (Join-Path $installDir "zboard.exe") -Force
+    Write-Output "Installed $(Join-Path $installDir 'zboard.exe')"
     if (($env:PATH -split ";") -notcontains $installDir) {
         Write-Output "Add $installDir to PATH, then restart your agent client."
     }

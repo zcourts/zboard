@@ -1,5 +1,6 @@
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const AGENT_SCHEMA: &str = "aiboard.agent.v1";
 pub const MESSAGE_SCHEMA: &str = "aiboard.message.v1";
@@ -32,6 +33,8 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
@@ -77,12 +80,16 @@ pub enum Command {
         to: Vec<String>,
         group: Option<String>,
         message: String,
+        #[serde(default)]
+        meta: Option<Value>,
         ttl_seconds: Option<u64>,
     },
     #[serde(rename = "reply")]
     Reply {
         to: String,
         message: String,
+        #[serde(default)]
+        meta: Option<Value>,
         ttl_seconds: Option<u64>,
     },
     #[serde(rename = "group.create")]
@@ -96,6 +103,7 @@ pub enum Command {
     #[serde(rename = "history")]
     History {
         thread: Option<String>,
+        group: Option<String>,
         limit: Option<usize>,
     },
     #[serde(rename = "ping")]

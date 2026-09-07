@@ -236,6 +236,7 @@ pub fn history(
     agent: &Agent,
     groups: impl Iterator<Item = String>,
     thread: Option<&str>,
+    group: Option<&str>,
     limit: usize,
 ) -> (Vec<Message>, Vec<String>) {
     let mut routes = vec![
@@ -244,6 +245,14 @@ pub fn history(
         format!("direct:{}", agent.id),
     ];
     routes.extend(groups.map(|group| format!("group:{group}")));
+    if let Some(group) = group {
+        let expected = if group == "global" || group.starts_with("project:") {
+            group.to_owned()
+        } else {
+            format!("group:{group}")
+        };
+        routes.retain(|route| route == &expected);
+    }
     let mut paths = Vec::new();
     for route in routes {
         let route_root = route_directory(root, &route);
@@ -551,6 +560,7 @@ mod tests {
             thread: id,
             reply_to: None,
             message: "hello".to_owned(),
+            meta: None,
             expires_at: None,
         }
     }
@@ -572,6 +582,34 @@ mod tests {
                 .iter()
                 .any(|path| path.to_string_lossy().contains("other-three"))
         );
+    }
+
+    #[test]
+    fn history_can_select_one_joined_group() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let mut selected = message(Ulid::new().to_string());
+        selected.to.clear();
+        selected.group = Some("job-selected".to_owned());
+        selected.message = "selected".to_owned();
+        publish(root.path(), &selected).unwrap();
+        let mut unrelated = message(Ulid::new().to_string());
+        unrelated.to.clear();
+        unrelated.group = Some("job-unrelated".to_owned());
+        unrelated.message = "unrelated".to_owned();
+        publish(root.path(), &unrelated).unwrap();
+
+        let (messages, warnings) = history(
+            root.path(),
+            &agent(),
+            ["job-selected".to_owned(), "job-unrelated".to_owned()].into_iter(),
+            None,
+            Some("job-selected"),
+            50,
+        );
+
+        assert!(warnings.is_empty());
+        assert_eq!(messages, vec![selected]);
     }
 
     #[test]

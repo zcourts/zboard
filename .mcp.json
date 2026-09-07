@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "aiboard": {
-      "command": "aiboard",
+    "zboard": {
+      "command": "zboard",
       "args": ["mcp"]
     }
   }

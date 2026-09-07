@@ -160,6 +160,7 @@ fn handle_command(
             to,
             group,
             message,
+            meta,
             ttl_seconds,
         } => {
             if let Some(group) = group.as_deref() {
@@ -176,6 +177,7 @@ fn handle_command(
                     thread: None,
                     reply_to: None,
                     body: message,
+                    meta,
                     ttl_seconds,
                 },
             )?;
@@ -186,6 +188,7 @@ fn handle_command(
         Command::Reply {
             to,
             message,
+            meta,
             ttl_seconds,
         } => {
             let parent = state
@@ -211,6 +214,7 @@ fn handle_command(
                     thread: Some(parent.thread),
                     reply_to: Some(parent.id),
                     body: message,
+                    meta,
                     ttl_seconds,
                 },
             )?;
@@ -250,10 +254,20 @@ fn handle_command(
                 .collect();
             emit(output, &Output::Groups { groups })?;
         }
-        Command::History { thread, limit } => {
+        Command::History {
+            thread,
+            group,
+            limit,
+        } => {
             let limit = limit.unwrap_or(50).min(1_000);
-            let (messages, warnings) =
-                relevant_history(version_root, state, agent, thread.as_deref(), limit);
+            let (messages, warnings) = relevant_history(
+                version_root,
+                state,
+                agent,
+                thread.as_deref(),
+                group.as_deref(),
+                limit,
+            );
             for warning in warnings {
                 emit(output, &Output::Warning { message: &warning })?;
             }
@@ -487,6 +501,7 @@ mod tests {
                 thread: None,
                 reply_to: None,
                 body: "question".to_owned(),
+                meta: None,
                 ttl_seconds: None,
             },
         )
@@ -501,6 +516,7 @@ mod tests {
             Command::Reply {
                 to: parent.id.clone(),
                 message: "answer".to_owned(),
+                meta: None,
                 ttl_seconds: None,
             },
             &mut output,
@@ -527,6 +543,7 @@ mod tests {
                     thread: None,
                     reply_to: None,
                     body: body.to_owned(),
+                    meta: None,
                     ttl_seconds: None,
                 },
             )
@@ -540,6 +557,7 @@ mod tests {
             &mut state,
             Command::History {
                 thread: None,
+                group: None,
                 limit: Some(2),
             },
             &mut output,
@@ -568,6 +586,7 @@ mod tests {
                     thread: None,
                     reply_to: None,
                     body: body.to_owned(),
+                    meta: None,
                     ttl_seconds: None,
                 },
             )
@@ -582,6 +601,7 @@ mod tests {
             &mut state,
             Command::History {
                 thread: None,
+                group: None,
                 limit: None,
             },
             &mut output,

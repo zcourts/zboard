@@ -14,7 +14,7 @@ use crate::app::{RunOptions, default_root, parse_duration_seconds, required_valu
 
 fn main() {
     if let Err(error) = try_main() {
-        eprintln!("aiboard: {error:#}");
+        eprintln!("zboard: {error:#}");
         std::process::exit(2);
     }
 }
@@ -35,7 +35,9 @@ fn try_main() -> Result<()> {
 
 fn migrate_command(mut args: impl Iterator<Item = String>) -> Result<()> {
     let current_directory = env::current_dir().context("read current directory")?;
-    let mut root = env::var_os("AIBOARD_ROOT").map(PathBuf::from);
+    let mut root = env::var_os("ZBOARD_ROOT")
+        .or_else(|| env::var_os("AIBOARD_ROOT"))
+        .map(PathBuf::from);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--root" => root = Some(PathBuf::from(required_value(&mut args, "--root")?)),
@@ -50,9 +52,14 @@ fn migrate_command(mut args: impl Iterator<Item = String>) -> Result<()> {
 
 fn mcp_command(mut args: impl Iterator<Item = String>) -> Result<()> {
     let current_directory = env::current_dir().context("read current directory")?;
-    let mut root = env::var_os("AIBOARD_ROOT").map(PathBuf::from);
-    let mut project = env::var("AIBOARD_PROJECT").ok();
-    let mut session = env::var("AIBOARD_SESSION_ID")
+    let mut root = env::var_os("ZBOARD_ROOT")
+        .or_else(|| env::var_os("AIBOARD_ROOT"))
+        .map(PathBuf::from);
+    let mut project = env::var("ZBOARD_PROJECT")
+        .or_else(|_| env::var("AIBOARD_PROJECT"))
+        .ok();
+    let mut session = env::var("ZBOARD_SESSION_ID")
+        .or_else(|_| env::var("AIBOARD_SESSION_ID"))
         .or_else(|_| env::var("CODEX_THREAD_ID"))
         .or_else(|_| env::var("CODEX_SESSION_ID"))
         .or_else(|_| env::var("CLAUDE_SESSION_ID"))
@@ -120,8 +127,12 @@ fn project_slug(path: &std::path::Path) -> String {
 
 fn run_command(mut args: impl Iterator<Item = String>) -> Result<()> {
     let current_directory = env::current_dir().context("read current directory")?;
-    let mut root = env::var_os("AIBOARD_ROOT").map(PathBuf::from);
-    let mut project = env::var("AIBOARD_PROJECT").ok();
+    let mut root = env::var_os("ZBOARD_ROOT")
+        .or_else(|| env::var_os("AIBOARD_ROOT"))
+        .map(PathBuf::from);
+    let mut project = env::var("ZBOARD_PROJECT")
+        .or_else(|_| env::var("AIBOARD_PROJECT"))
+        .ok();
     let mut session = env::var("CODEX_THREAD_ID")
         .or_else(|_| env::var("CODEX_SESSION_ID"))
         .ok();
@@ -146,7 +157,7 @@ fn run_command(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
 
-    let project = project.context("set --project or AIBOARD_PROJECT")?;
+    let project = project.context("set --project or ZBOARD_PROJECT")?;
     let session = session
         .context("set --session, CODEX_THREAD_ID, or CODEX_SESSION_ID so registration is stable")?;
     app::run(RunOptions {
@@ -160,9 +171,9 @@ fn run_command(mut args: impl Iterator<Item = String>) -> Result<()> {
 
 fn print_help() {
     println!(
-        "aiboard - shared-filesystem message board for AI agents\n\n\
-         USAGE:\n  aiboard run --project <slug> [OPTIONS]\n  aiboard mcp [OPTIONS]\n  aiboard migrate [--root <path>]\n\n\
-         OPTIONS:\n  --root <path>           Board root; defaults to AIBOARD_ROOT or ancestor .ai/message-board\n  \
+        "zboard - shared-filesystem message board for AI agents\n\n\
+         USAGE:\n  zboard run --project <slug> [OPTIONS]\n  zboard mcp [OPTIONS]\n  zboard migrate [--root <path>]\n\n\
+         OPTIONS:\n  --root <path>           Board root; defaults to ZBOARD_ROOT or ancestor .ai/message-board\n  \
          --project <slug>       Agent project; MCP also defaults to the current directory name\n  \
          --session <id>         Stable session; uses known agent session environment variables\n  \
          --path <path>          Descriptive project path; defaults to current directory\n  \

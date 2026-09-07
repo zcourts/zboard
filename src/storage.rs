@@ -177,6 +177,7 @@ pub struct MessageDraft {
     pub thread: Option<String>,
     pub reply_to: Option<String>,
     pub body: String,
+    pub meta: Option<serde_json::Value>,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -187,6 +188,7 @@ pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> 
         thread,
         reply_to,
         body,
+        meta,
         ttl_seconds,
     } = draft;
     let has_recipients = !to.is_empty();
@@ -217,6 +219,7 @@ pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> 
         thread: thread.unwrap_or_else(|| id.clone()),
         reply_to,
         message: body,
+        meta,
         expires_at,
     };
     routed::publish(board_root(version_root), &message)?;
@@ -244,13 +247,21 @@ pub fn relevant_history(
     state: &BoardState,
     agent: &Agent,
     thread: Option<&str>,
+    group: Option<&str>,
     limit: usize,
 ) -> (Vec<Message>, Vec<String>) {
     let groups = state
         .memberships
         .iter()
         .filter_map(|(group, member)| (member == &agent.id).then_some(group.clone()));
-    routed::history(board_root(version_root), agent, groups, thread, limit)
+    routed::history(
+        board_root(version_root),
+        agent,
+        groups,
+        thread,
+        group,
+        limit,
+    )
 }
 
 pub fn touch_presence(version_root: &Path, agent_id: &str) -> Result<Presence> {
@@ -781,6 +792,7 @@ mod tests {
             thread: Ulid::new().to_string(),
             reply_to: None,
             message: "hello".to_owned(),
+            meta: None,
             expires_at: None,
         };
         assert!(message_is_relevant(

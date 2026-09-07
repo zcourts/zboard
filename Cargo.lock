@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "aiboard"
-version = "0.3.0"
+name = "zboard"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",

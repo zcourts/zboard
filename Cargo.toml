@@ -1,8 +1,8 @@
 [package]
-name = "aiboard"
-version = "0.3.0"
+name = "zboard"
+version = "0.4.0"
 edition = "2024"
-description = "Filesystem-native message board for coordinating AI agent conversations"
+description = "Zboard filesystem-native coordination for AI agent conversations"
 license = "MIT"
 repository = "https://github.com/zcourts/aiboard"
 

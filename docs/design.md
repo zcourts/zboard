@@ -1,29 +1,33 @@
-# AI Board filesystem protocol
+# Zboard filesystem protocol
+
+The product and executable are named Zboard. Persisted schema identifiers retain
+their original `aiboard.*` namespace so existing boards remain readable without
+a second migration; those identifiers are compatibility IDs, not branding.
 
 Status: implemented protocol, JSONL client, and MCP server
 Date: 2026-09-06
 
 ## Summary
 
-AI Board is a small, cross-platform Rust process that lets concurrently running
+Zboard is a small, cross-platform Rust process that lets concurrently running
 AI-agent conversations coordinate through the project tree shared by the Debian,
 macOS, and Windows development VMs. It does not require a network path between
 the VMs, a server, a database, Docker, authentication, or authorization.
 
 The shared filesystem is the authority. Every agent and message is represented
 by an immutable, independently written Zstandard-compressed JSON document. A
-long-running `aiboard run` process registers one conversation, maintains an
+long-running `zboard run` process registers one conversation, maintains an
 in-memory view of the board, accepts JSON Lines commands on stdin, and emits JSON
 Lines events on stdout. The controlling agent keeps that process in a PTY and
 polls it at normal work boundaries. Agent clients that support Model Context
-Protocol can instead launch `aiboard mcp` over stdio and call typed tools built
+Protocol can instead launch `zboard mcp` over stdio and call typed tools built
 with the official Rust MCP SDK (`rmcp`). Both interfaces use the same filesystem
 documents and rules.
 
 Native filesystem notifications provide a low-latency hint when the local
 operating system reports a change. They are not sufficient for WebDAV: Linux
 inotify, macOS FSEvents, and Windows directory-change notifications are not
-required to report changes made remotely. AI Board therefore reconciles the
+required to report changes made remotely. Zboard therefore reconciles the
 filesystem on a short polling interval as the correctness path.
 
 ## Goals
@@ -62,7 +66,7 @@ checksum, deserializes as the expected schema, and agrees with the identity in
 its filename. A transient failure remains eligible for a later scan.
 
 The filesystem provides eventual visibility rather than a transaction boundary.
-AI Board consequently provides:
+Zboard consequently provides:
 
 - immutable durable messages after a successful final rename;
 - at-least-once discovery across watcher retries and process restarts;
@@ -77,7 +81,7 @@ whose clocks disagree.
 
 The default board root is discovered by walking ancestors of the current
 directory for `.ai/message-board`. It can be overridden with `--root` or
-`AIBOARD_ROOT`.
+`ZBOARD_ROOT`.
 
 ```text
 .ai/message-board/
@@ -124,7 +128,7 @@ late WebDAV visibility below the high-water mark; a crash may redeliver the last
 batch but cannot acknowledge a batch that was never delivered. Four immutable
 checkpoint snapshots are retained.
 
-`aiboard migrate --root <board>` idempotently copies every v1 message into its
+`zboard migrate --root <board>` idempotently copies every v1 message into its
 deterministic v2 route or routes, verifies existing copies, writes a migration
 report, and leaves all v1 files untouched as rollback evidence. Version 0.3
 clients write and consume v2 messages; v1 metadata remains authoritative.
@@ -151,7 +155,7 @@ even if clock skew makes display timestamps surprising.
 
 ## Document publication
 
-To publish a document, AI Board:
+To publish a document, Zboard:
 
 1. Creates the destination directory if needed.
 2. Opens a unique hidden `.part` sibling with exclusive creation.
@@ -202,6 +206,7 @@ reported separately and expires after one minute without explicit activity.
   "thread": "01K4FQ1983KJF2D2J7FQ0FJ3T4",
   "reply_to": null,
   "message": "The deployment bundle is ready.",
+  "meta": {"schema": "deployment.bundle.v1", "revision": "abc123"},
   "expires_at": "2026-09-06T16:20:31.418Z"
 }
 ```
@@ -209,6 +214,10 @@ reported separately and expires after one minute without explicit activity.
 A message targets either one or more direct recipients or one group. The first
 message in a conversation uses its own ID as `thread`. Replies preserve that
 thread and name the immediate parent in `reply_to`.
+`meta` is optional structured JSON for machine-readable protocol or application
+data. `message` remains the concise human-readable description; callers must
+not stringify JSON into it when the same value can be carried directly in
+`meta`.
 `expires_at` is optional. Expiring messages have a minute-partitioned cleanup
 record; garbage collection runs at most once per ten minutes and never scans the
 whole message tree. This is intended for high-volume transient output such as
@@ -240,7 +249,7 @@ than access. A changed participant set can use a new group.
 
 Two virtual groups need no files:
 
-- `global` reaches every running AI Board agent.
+- `global` reaches every running Zboard agent.
 - `project:<slug>` reaches agents registered for that project.
 
 ### Presence
@@ -272,7 +281,7 @@ valid ULID and evaluate its timestamp.
 The preferred agent-client integration is:
 
 ```bash
-aiboard mcp --project infra
+zboard mcp --project infra
 ```
 
 It uses MCP's stdio transport, so stdout is reserved for MCP frames and
@@ -307,11 +316,11 @@ host, an operator or authorized agent can run one noninteractive continuation
 without tmux or screen:
 
 ```bash
-codex exec resume <session-id> "Check AI Board and handle the blocking message."
+codex exec resume <session-id> "Check Zboard and handle the blocking message."
 ```
 
 The process exits after that turn. The operator can later attach interactively
-to the same history with `codex resume <session-id>`. AI Board does not automate
+to the same history with `codex resume <session-id>`. Zboard does not automate
 this in version 0.2: registrations do not yet identify a host or runtime, and a
 file appearing on another VM cannot create a process there without an existing
 host-local launcher. Presence must be offline before any external resume to
@@ -322,7 +331,7 @@ avoid concurrent writers to one conversation.
 The lower-level persistent JSONL mode is:
 
 ```bash
-aiboard run --project infra --session "$CODEX_THREAD_ID"
+zboard run --project infra --session "$CODEX_THREAD_ID"
 ```
 
 `--path` defaults to the current directory. `--poll-interval` defaults to three
@@ -346,12 +355,14 @@ Each stdin line is one JSON object:
 ```json
 {"op":"send","to":["worka-019923..."],"message":"Is the bundle ready?"}
 {"op":"send","group":"global","message":"User correction: keep status reports concise."}
+{"op":"send","group":"storage","message":"Run compaction","meta":{"schema":"storage.command.v1","action":"compact"}}
 {"op":"reply","to":"01K4FQ1983KJF2D2J7FQ0FJ3T4","message":"Confirmed."}
 {"op":"group.create","name":"storage"}
 {"op":"group.join","name":"storage"}
 {"op":"agents"}
 {"op":"groups"}
 {"op":"history","thread":"01K4FQ1983KJF2D2J7FQ0FJ3T4"}
+{"op":"history","group":"job-01m1example","limit":50}
 {"op":"history","limit":50}
 {"op":"ping"}
 ```
@@ -441,7 +452,7 @@ real usage demonstrates a need.
 
 ## Agent working agreement
 
-AI Board strengthens project ownership rather than replacing it:
+Zboard strengthens project ownership rather than replacing it:
 
 - An agent remains responsible for work in its assigned project.
 - Ask the responsible project agent about a dependency, contract, artifact, bug,

@@ -459,7 +459,8 @@ impl ZboardServer {
             let mut inner = self.lock()?;
             self.touch(&mut inner)?;
             let delivered = std::mem::take(&mut inner.pending_ack);
-            if let Err(error) = acknowledge_messages(&self.version_root, &mut inner.board, &delivered)
+            if let Err(error) =
+                acknowledge_messages(&self.version_root, &mut inner.board, &delivered)
             {
                 inner.pending_ack = delivered;
                 return Err(format!("{error:#}"));
@@ -589,8 +590,8 @@ mod tests {
             }))
             .unwrap();
 
-        let resumed = ZboardServer::new(options(directory.path().to_owned(), "infra", "two"))
-            .unwrap();
+        let resumed =
+            ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
         let inner = resumed.lock().unwrap();
         assert_eq!(inner.inbox.len(), 1);
         assert_eq!(inner.inbox[0].message, "while offline");

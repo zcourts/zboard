@@ -478,9 +478,11 @@ fn resolve_expiry_target(root: &Path, stored: &str, message: &str) -> Result<Pat
         .iter()
         .position(|component| component.as_os_str() == "v2")
     {
-        components[index..].iter().fold(root.to_owned(), |path, component| {
-            path.join(component.as_os_str())
-        })
+        components[index..]
+            .iter()
+            .fold(root.to_owned(), |path, component| {
+                path.join(component.as_os_str())
+            })
     } else if path.is_relative() {
         root.join(path)
     } else {
@@ -812,9 +814,12 @@ mod tests {
             .pop()
             .unwrap();
         let expiry: Expiry = read_document(&expiry_path).unwrap();
-        assert!(expiry.paths.iter().all(|path| {
-            path.starts_with("v2/messages/") && !path.contains('\\')
-        }));
+        assert!(
+            expiry
+                .paths
+                .iter()
+                .all(|path| { path.starts_with("v2/messages/") && !path.contains('\\') })
+        );
         let relocated = directory.path().join("macos-board");
         fs::rename(&original, &relocated).unwrap();
 

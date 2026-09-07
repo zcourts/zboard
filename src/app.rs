@@ -118,9 +118,8 @@ fn event_loop(
             }
             Ok(LoopEvent::Filesystem) => {
                 filesystem_pending.store(false, Ordering::Release);
-                reconcile_at = reconcile_at.min(
-                    std::time::Instant::now() + Duration::from_millis(50),
-                );
+                reconcile_at =
+                    reconcile_at.min(std::time::Instant::now() + Duration::from_millis(50));
             }
             Err(RecvTimeoutError::Timeout) => reconcile_due = true,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),

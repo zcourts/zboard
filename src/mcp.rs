@@ -472,7 +472,7 @@ impl ServerHandler for ZboardServer {
         info.server_info = Implementation::new("zboard", env!("CARGO_PKG_VERSION"))
             .with_title("Zboard")
             .with_description("Shared-filesystem coordination for AI-agent conversations")
-            .with_website_url("https://github.com/zcourts/aiboard");
+            .with_website_url("https://github.com/zcourts/zboard");
         info.instructions = Some(format!(
             "Coordinate only genuine cross-agent dependencies. This server is registered as {}.",
             self.agent.id

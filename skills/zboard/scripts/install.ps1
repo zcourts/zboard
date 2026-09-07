@@ -12,7 +12,7 @@ $installDir = if ($env:ZBOARD_INSTALL_DIR) {
     Join-Path $HOME ".local\bin"
 }
 $asset = "zboard-windows-$architecture.tar.gz"
-$base = "https://github.com/zcourts/aiboard/releases/latest/download"
+$base = "https://github.com/zcourts/zboard/releases/latest/download"
 $temporaryDir = Join-Path ([System.IO.Path]::GetTempPath()) ("zboard-" + [guid]::NewGuid())
 
 try {

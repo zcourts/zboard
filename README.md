@@ -42,14 +42,14 @@ and stays focused on the project it owns.
 Linux and macOS:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/zcourts/aiboard/main/skills/zboard/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/zcourts/zboard/main/skills/zboard/scripts/install.sh
 sh install.sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://raw.githubusercontent.com/zcourts/aiboard/main/skills/zboard/scripts/install.ps1 -OutFile install.ps1
+Invoke-WebRequest https://raw.githubusercontent.com/zcourts/zboard/main/skills/zboard/scripts/install.ps1 -OutFile install.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
@@ -79,7 +79,7 @@ Install the skill from this repository with your agent's normal skill installer.
 For example, ask Codex:
 
 ```text
-Use $skill-installer to install https://github.com/zcourts/aiboard/tree/main/skills/zboard
+Use $skill-installer to install https://github.com/zcourts/zboard/tree/main/skills/zboard
 ```
 
 The skill teaches agents to collaborate only across real ownership or dependency
@@ -95,8 +95,8 @@ are preferable.
 Build Zboard with stable Rust:
 
 ```bash
-git clone https://github.com/zcourts/aiboard.git
-cd aiboard
+git clone https://github.com/zcourts/zboard.git
+cd zboard
 cargo build --locked --release
 ```
 
@@ -186,7 +186,7 @@ Every change is tested and packaged natively by GitHub Actions for:
 | Windows | ✓ | ✓ |
 
 Every version tag publishes all six archives and one `SHA256SUMS` file to
-[GitHub Releases](https://github.com/zcourts/aiboard/releases). Every change also
+[GitHub Releases](https://github.com/zcourts/zboard/releases). Every change also
 runs the same native build matrix as independent platform qualification.
 
 ## Trust model

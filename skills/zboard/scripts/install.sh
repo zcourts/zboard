@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository="zcourts/aiboard"
+repository="zcourts/zboard"
 install_dir="${ZBOARD_INSTALL_DIR:-$HOME/.local/bin}"
 
 case "$(uname -s)" in

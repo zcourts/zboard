@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::model::{Command, GroupSummary, Output};
 use crate::storage::{
@@ -84,7 +84,6 @@ pub fn run(options: RunOptions) -> Result<()> {
         &options.root,
         event_tx.clone(),
         Arc::clone(&filesystem_pending),
-        &mut output,
     );
 
     event_loop(
@@ -403,42 +402,49 @@ fn start_native_watcher(
     board_root: &Path,
     event_tx: Sender<LoopEvent>,
     filesystem_pending: Arc<AtomicBool>,
-    output: &mut impl Write,
-) -> Option<RecommendedWatcher> {
-    let callback_tx = event_tx.clone();
-    let watcher =
-        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
-            Ok(event)
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) =>
-            {
-                if !filesystem_pending.swap(true, Ordering::AcqRel) {
-                    let _ = callback_tx.send(LoopEvent::Filesystem);
+) -> Sender<()> {
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let board_root = board_root.to_owned();
+    // Recursive watch attachment can take minutes on shared/WebDAV mounts.
+    // Keep stdin and periodic reconciliation live while notify attaches.
+    thread::spawn(move || {
+        let callback_tx = event_tx.clone();
+        let watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+                Ok(event)
+                    if matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) =>
+                {
+                    if !filesystem_pending.swap(true, Ordering::AcqRel) {
+                        let _ = callback_tx.send(LoopEvent::Filesystem);
+                    }
                 }
-            }
-            Ok(_) => {}
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = callback_tx.send(LoopEvent::WatchWarning(format!(
+                        "native watcher error: {error}"
+                    )));
+                }
+            });
+        let mut watcher = match watcher {
+            Ok(watcher) => watcher,
             Err(error) => {
-                let _ = callback_tx.send(LoopEvent::WatchWarning(format!(
-                    "native watcher error: {error}"
-                )));
+                let message =
+                    format!("native watcher unavailable; polling remains active: {error}");
+                let _ = event_tx.send(LoopEvent::WatchWarning(message));
+                return;
             }
-        });
-    let mut watcher = match watcher {
-        Ok(watcher) => watcher,
-        Err(error) => {
+        };
+        if let Err(error) = watcher.watch(&board_root, RecursiveMode::Recursive) {
             let message = format!("native watcher unavailable; polling remains active: {error}");
-            let _ = emit(output, &Output::Warning { message: &message });
-            return None;
+            let _ = event_tx.send(LoopEvent::WatchWarning(message));
+            return;
         }
-    };
-    if let Err(error) = watcher.watch(board_root, RecursiveMode::Recursive) {
-        let message = format!("native watcher unavailable; polling remains active: {error}");
-        let _ = emit(output, &Output::Warning { message: &message });
-        return None;
-    }
-    Some(watcher)
+        let _ = stop_rx.recv();
+    });
+    stop_tx
 }
 
 fn emit(output: &mut impl Write, event: &Output<'_>) -> Result<()> {

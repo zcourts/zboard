@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Host-local lifetime management; all board data stays on the shared volume.
+set -euo pipefail
+umask 077
+
+if [[ ${1:-} == _run ]]; then
+  shift
+  state=$1 board=$2 project=$3 session=$4 project_path=$5 binary=$6 codex=$7
+  mkdir -p "$state"
+  touch "$state/events.jsonl" "$state/wake.log"
+  [[ -p "$state/commands.fifo" ]] || mkfifo "$state/commands.fifo"
+  exec 3<>"$state/commands.fifo"
+  board_pid= wake_pid=
+  trap '[[ -z "$board_pid" ]] || kill "$board_pid" 2>/dev/null || true; [[ -z "$wake_pid" ]] || kill "$wake_pid" 2>/dev/null || true' EXIT
+  agent="$project-$(printf '%s' "$session" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+  "$binary" wake --events "$state/events.jsonl" --state "$state/wake.json" \
+    --agent "$agent" --thread "$session" --codex "$codex" >>"$state/wake.log" 2>&1 &
+  wake_pid=$!
+  # Establish the initial EOF checkpoint before Zboard can emit new messages.
+  for attempt in {1..100}; do
+    [[ -f "$state/wake.json" ]] && break
+    kill -0 "$wake_pid"
+    sleep 0.1
+  done
+  [[ -f "$state/wake.json" ]] || exit 1
+  "$binary" run --root "$board" --project "$project" --session "$session" \
+    --path "$project_path" <&3 >>"$state/events.jsonl" 2>>"$state/board-errors.log" &
+  board_pid=$!
+  # No automatic presence pings: a listener being alive does not mean an agent is online.
+  wait -n "$board_pid" "$wake_pid"
+  exit 1
+fi
+
+if [[ $# != 4 ]]; then
+  echo 'Usage: bash scripts/codex-board <project> <Codex-thread-UUID> <project-path> <board-root>' >&2
+  exit 2
+fi
+project=$1 session=$2 project_path=$3 board=$4
+[[ "$project" =~ ^[a-z0-9_-]+$ && "$session" =~ ^[a-zA-Z0-9-]+$ ]] || exit 2
+binary=${ZBOARD_BIN:?Set ZBOARD_BIN to the installed zboard binary with wake support}
+codex=${ZBOARD_CODEX_BIN:-${CODEX_HOME:-$HOME/.codex}/packages/app-server-daemon/current/bin/codex}
+[[ -x "$binary" && -x "$codex" ]] || { echo 'Zboard or Codex binary not executable' >&2; exit 1; }
+"$codex" queue --help >/dev/null
+state="${XDG_STATE_HOME:-$HOME/.local/state}/zboard/$project-$session"
+unit="zboard-$project-$session"
+if ! systemctl --user is-active --quiet "$unit"; then
+  systemd-run --user --unit="$unit" --collect --service-type=exec \
+    --property=Restart=on-failure --property=RestartSec=5 \
+    --property=UMask=0077 --setenv="CODEX_HOME=${CODEX_HOME:-$HOME/.codex}" \
+    /bin/bash "$(realpath "$0")" _run "$state" "$board" "$project" "$session" \
+    "$project_path" "$binary" "$codex"
+fi
+printf 'Service: %s\nCommands: %s/commands.fifo\nEvents: %s/events.jsonl\nWake log: %s/wake.log\n' "$unit" "$state" "$state" "$state"

@@ -3,6 +3,7 @@ mod mcp;
 mod model;
 mod routed;
 mod storage;
+mod wake;
 
 use std::env;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ fn try_main() -> Result<()> {
         Some("run") => run_command(args),
         Some("mcp") => mcp_command(args),
         Some("migrate") => migrate_command(args),
+        Some("wake") => wake::command(args),
         Some("--help" | "-h") | None => {
             print_help();
             Ok(())
@@ -172,7 +174,7 @@ fn run_command(mut args: impl Iterator<Item = String>) -> Result<()> {
 fn print_help() {
     println!(
         "zboard - shared-filesystem message board for AI agents\n\n\
-         USAGE:\n  zboard run --project <slug> [OPTIONS]\n  zboard mcp [OPTIONS]\n  zboard migrate [--root <path>]\n\n\
+         USAGE:\n  zboard run --project <slug> [OPTIONS]\n  zboard mcp [OPTIONS]\n  zboard migrate [--root <path>]\n  zboard wake --events <jsonl> --state <checkpoint> --agent <id> --thread <uuid> --codex <binary>\n\n\
          OPTIONS:\n  --root <path>           Board root; defaults to ZBOARD_ROOT or ancestor .ai/message-board\n  \
          --project <slug>       Agent project; MCP also defaults to the current directory name\n  \
          --session <id>         Stable session; uses known agent session environment variables\n  \

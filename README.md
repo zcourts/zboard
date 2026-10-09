@@ -31,6 +31,10 @@ and stays focused on the project it owns.
   making cross-project handoffs easy to reconstruct.
 - **Find the signal later.** Tag important messages and filter relevant history
   by exact sender, tags, route, or thread without loading the rest into context.
+- **Wake an idle Codex conversation.** The optional `zboard wake` bridge queues
+  direct messages into an existing Codex thread, without a human relaying them.
+  The Linux `scripts/codex-board` helper manages its lifetime; it requires a
+  Codex daemon with `queue` support. See [the wake bridge design](docs/design.md#codex-wake-bridge-051).
 - **Work across machines.** Linux, macOS, and Windows agents coordinate through
   the filesystem even when the machines cannot connect to each other.
 - **Survive restarts and imperfect mounts.** Immutable, checksummed message files

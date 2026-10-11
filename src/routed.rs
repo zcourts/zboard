@@ -27,6 +27,7 @@ pub struct RoutedState {
     loaded: HashSet<PathBuf>,
     warned: HashSet<PathBuf>,
     last_gc: Option<Instant>,
+    last_checkpoint_id: Option<Ulid>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -134,6 +135,8 @@ pub fn initialize(root: &Path, state: &mut RoutedState, agent: &Agent) -> Result
     if let Some(path) = checkpoints.last() {
         let checkpoint: Checkpoint = read_document(path)?;
         if checkpoint.schema == CHECKPOINT_SCHEMA && checkpoint.agent == agent.id {
+            state.last_checkpoint_id =
+                Some(checkpoint.id.parse().context("invalid checkpoint ID")?);
             state.cursors = checkpoint.routes;
             return Ok(true);
         }
@@ -147,6 +150,11 @@ pub fn publish(root: &Path, message: &Message) -> Result<Vec<PathBuf>> {
     let mut routes = message_routes(message);
     routes.sort();
     routes.dedup();
+    // The existing sender route is the durable retry anchor even for group
+    // messages. Publish it first so a retry cannot silently change destinations.
+    let sender_route = format!("direct:{}", message.from);
+    routes.retain(|route| route != &sender_route);
+    routes.insert(0, sender_route);
     let mut paths = Vec::with_capacity(routes.len());
     for route in routes {
         let path = message_path(root, &route, message)?;
@@ -260,8 +268,21 @@ pub fn acknowledge(root: &Path, state: &mut RoutedState, messages: &[Message]) -
     write_checkpoint(root, state)
 }
 
-fn write_checkpoint(root: &Path, state: &RoutedState) -> Result<()> {
-    let id = Ulid::new().to_string();
+fn write_checkpoint(root: &Path, state: &mut RoutedState) -> Result<()> {
+    // Checkpoint selection and retention use filename order. Plain random
+    // ULIDs are not monotonic within one millisecond (or after clock rollback),
+    // so an acknowledged cursor could otherwise be replaced by an older one
+    // after restart. The consumer has one writer; retain its persisted floor.
+    let candidate = Ulid::new();
+    let checkpoint_id = match state.last_checkpoint_id {
+        Some(previous) if candidate <= previous => Ulid::from(
+            u128::from(previous)
+                .checked_add(1)
+                .context("checkpoint ID space exhausted")?,
+        ),
+        _ => candidate,
+    };
+    let id = checkpoint_id.to_string();
     let checkpoint = Checkpoint {
         schema: CHECKPOINT_SCHEMA.to_owned(),
         id: id.clone(),
@@ -274,6 +295,7 @@ fn write_checkpoint(root: &Path, state: &RoutedState) -> Result<()> {
         &directory.join(format!("{id}{DOCUMENT_SUFFIX}")),
         &checkpoint,
     )?;
+    state.last_checkpoint_id = Some(checkpoint_id);
     prune(&directory, 4);
     Ok(())
 }
@@ -469,13 +491,15 @@ pub fn migrate_v1(root: &Path) -> Result<MigrationReport> {
 
 fn message_routes(message: &Message) -> Vec<String> {
     if let Some(group) = message.group.as_deref() {
-        if group == "global" {
+        let mut routes = if group == "global" {
             vec!["global".to_owned()]
         } else if let Some(project) = group.strip_prefix("project:") {
             vec![format!("project:{project}")]
         } else {
             vec![format!("group:{group}")]
-        }
+        };
+        routes.push(format!("direct:{}", message.from));
+        routes
     } else {
         let mut agents = message.to.clone();
         agents.push(message.from.clone());
@@ -498,7 +522,7 @@ fn message_routes_for_consumer(message: &Message, agent: &str, project: &str) ->
         .collect()
 }
 
-fn route_directory(root: &Path, route: &str) -> PathBuf {
+pub(crate) fn route_directory(root: &Path, route: &str) -> PathBuf {
     let v2 = root.join("v2/messages");
     if route == "global" {
         return v2.join("global");
@@ -513,8 +537,12 @@ fn route_directory(root: &Path, route: &str) -> PathBuf {
     v2.join(collection).join(stable_shard(name)).join(name)
 }
 
-fn message_path(root: &Path, route: &str, message: &Message) -> Result<PathBuf> {
-    let id: Ulid = message.id.parse().context("parse message ULID")?;
+pub(crate) fn message_path(root: &Path, route: &str, message: &Message) -> Result<PathBuf> {
+    message_id_path(root, route, &message.id)
+}
+
+pub(crate) fn message_id_path(root: &Path, route: &str, message_id: &str) -> Result<PathBuf> {
+    let id: Ulid = message_id.parse().context("parse message ULID")?;
     let datetime = DateTime::<Utc>::from_timestamp_millis(id.timestamp_ms() as i64)
         .context("message ULID timestamp is out of range")?;
     Ok(route_directory(root, route)
@@ -523,8 +551,8 @@ fn message_path(root: &Path, route: &str, message: &Message) -> Result<PathBuf> 
         .join(format!("{:02}", datetime.day()))
         .join(format!("{:02}", datetime.hour()))
         .join(format!("{:02}", datetime.minute()))
-        .join(message.id.chars().last().unwrap_or('0').to_string())
-        .join(format!("{}{DOCUMENT_SUFFIX}", message.id)))
+        .join(message_id.chars().last().unwrap_or('0').to_string())
+        .join(format!("{message_id}{DOCUMENT_SUFFIX}")))
 }
 
 fn recent_paths(root: &Path, route: &str) -> Vec<PathBuf> {
@@ -990,6 +1018,78 @@ mod tests {
         assert_eq!(
             scan(root.path(), &mut resumed, std::iter::empty()).0,
             vec![late]
+        );
+    }
+
+    #[test]
+    fn checkpoint_order_survives_clock_rollback_and_preserves_latest_ack() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let reader = agent();
+        let mut first = RoutedState::default();
+        initialize(root.path(), &mut first, &reader).unwrap();
+
+        // Simulate a persisted checkpoint created before the clock stepped
+        // backwards. New wall-clock ULIDs must not sort below this checkpoint.
+        let future = Ulid::from_parts(Utc::now().timestamp_millis() as u64 + 60_000, 5);
+        let checkpoint = Checkpoint {
+            schema: CHECKPOINT_SCHEMA.into(),
+            id: future.to_string(),
+            agent: reader.id.clone(),
+            updated_at: now(),
+            routes: BTreeMap::new(),
+        };
+        write_document(
+            &consumer_directory(root.path(), &reader.id).join(format!("{future}{DOCUMENT_SUFFIX}")),
+            &checkpoint,
+        )
+        .unwrap();
+
+        let mut resumed = RoutedState::default();
+        initialize(root.path(), &mut resumed, &reader).unwrap();
+        let item = message(Ulid::new().to_string());
+        publish(root.path(), &item).unwrap();
+        let received = scan(root.path(), &mut resumed, std::iter::empty()).0;
+        assert_eq!(received, vec![item.clone()]);
+        acknowledge(root.path(), &mut resumed, &received).unwrap();
+        let first_ack_id = resumed.last_checkpoint_id.unwrap();
+        assert!(first_ack_id > future);
+        acknowledge(root.path(), &mut resumed, &received).unwrap();
+        assert!(resumed.last_checkpoint_id.unwrap() > first_ack_id);
+
+        let mut final_reader = RoutedState::default();
+        initialize(root.path(), &mut final_reader, &reader).unwrap();
+        assert!(
+            scan(root.path(), &mut final_reader, std::iter::empty())
+                .0
+                .is_empty()
+        );
+        assert_eq!(final_reader.cursors["direct:infra-two"].high_water, item.id);
+    }
+
+    #[test]
+    fn sender_group_anchor_is_acknowledged_with_group_route() {
+        let root = tempdir().unwrap();
+        ensure(root.path()).unwrap();
+        let reader = agent();
+        let mut item = message(Ulid::new().to_string());
+        item.from = reader.id.clone();
+        item.to.clear();
+        item.group = Some("global".into());
+        publish(root.path(), &item).unwrap();
+        let mut first = RoutedState::default();
+        initialize(root.path(), &mut first, &reader).unwrap();
+        let received = scan(root.path(), &mut first, std::iter::empty()).0;
+        assert_eq!(received, vec![item.clone()]);
+        acknowledge(root.path(), &mut first, &received).unwrap();
+        assert_eq!(first.cursors["global"].high_water, item.id);
+        assert_eq!(first.cursors["direct:infra-two"].high_water, item.id);
+        let mut resumed = RoutedState::default();
+        initialize(root.path(), &mut resumed, &reader).unwrap();
+        assert!(
+            scan(root.path(), &mut resumed, std::iter::empty())
+                .0
+                .is_empty()
         );
     }
 

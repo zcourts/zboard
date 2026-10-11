@@ -1,24 +1,21 @@
-use std::collections::VecDeque;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
 use rmcp::{Json, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
-use crate::model::{Agent, AgentStatus, Message};
-use crate::storage::{
-    BoardState, MessageDraft, acknowledge_messages, agent_statuses, create_group,
-    direct_reply_recipients, ensure_layout, group_members, initialize_routing, join_group,
-    message_is_relevant, normalize_tags, publish_message, register_agent, relevant_history, scan,
-    touch_presence,
-};
+use crate::client::{Client, ReplyRequest, SendRequest};
+use crate::model::Agent;
+use crate::query::{self, AgentQuery, GroupQuery, HistoryQuery};
+use crate::storage::{create_group, group_members, join_group, touch_presence};
 
 pub struct McpOptions {
     pub root: PathBuf,
@@ -28,18 +25,14 @@ pub struct McpOptions {
     pub poll_interval: Duration,
 }
 
-struct Inner {
-    board: BoardState,
-    inbox: VecDeque<Message>,
-    pending_ack: Vec<Message>,
-}
-
+/// MCP reads are snapshots. They never own or acknowledge the wake listener's
+/// durable delivery cursor, even when both interfaces share an agent identity.
 #[derive(Clone)]
 pub struct ZboardServer {
-    version_root: PathBuf,
+    root: PathBuf,
     agent: Agent,
     poll_interval: Duration,
-    inner: Arc<Mutex<Inner>>,
+    inbox_seen: Arc<Mutex<BTreeSet<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -53,6 +46,8 @@ struct SendInput {
     tags: Vec<String>,
     meta: Option<Value>,
     ttl_seconds: Option<u64>,
+    /// A caller-generated ULID reused with identical content on uncertain retries.
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -62,6 +57,8 @@ struct ReplyInput {
     tags: Option<Vec<String>>,
     meta: Option<Value>,
     ttl_seconds: Option<u64>,
+    /// A caller-generated ULID reused with identical content on uncertain retries.
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -69,160 +66,69 @@ struct GroupInput {
     name: String,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct HistoryInput {
-    thread: Option<String>,
-    group: Option<String>,
-    sender: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetInput {
+    ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ThreadInput {
+    message_id: String,
+    before: Option<String>,
     limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct PollInput {
+    /// Explicit resume cursor. Omit to read a recent relevant window.
+    cursor: Option<String>,
     timeout_ms: Option<u64>,
     limit: Option<usize>,
 }
 
-#[derive(Debug, JsonSchema, Serialize)]
-struct IdentityOutput {
-    agent: Agent,
+fn output(value: impl serde::Serialize) -> Result<Json<Value>, String> {
+    serde_json::to_value(value)
+        .map(Json)
+        .map_err(|error| error.to_string())
 }
 
-#[derive(Debug, JsonSchema, Serialize)]
-struct AgentsOutput {
-    agents: Vec<AgentStatus>,
-}
-
-#[derive(Debug, JsonSchema, Serialize)]
-struct GroupOutput {
-    name: String,
-    created_by: String,
-    members: Vec<String>,
-}
-
-#[derive(Debug, JsonSchema, Serialize)]
-struct GroupsOutput {
-    groups: Vec<GroupOutput>,
-}
-
-#[derive(Debug, JsonSchema, Serialize)]
-struct TagsOutput {
-    tags: Vec<String>,
-}
-
-#[derive(Debug, JsonSchema, Serialize)]
-struct MessageOutput {
-    message: Message,
-}
-
-#[derive(Debug, JsonSchema, Serialize)]
-struct MessagesOutput {
-    messages: Vec<Message>,
-    warnings: Vec<String>,
+fn error(error: anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 impl ZboardServer {
     fn new(options: McpOptions) -> Result<Self> {
-        let version_root = ensure_layout(&options.root)?;
-        let agent = register_agent(
-            &version_root,
+        let client = Client::open(
+            &options.root,
             &options.project,
             &options.session,
-            std::env::consts::OS,
             &options.project_path,
         )?;
-        touch_presence(&version_root, &agent.id)?;
-        let mut board = BoardState::default();
-        let resumed = initialize_routing(&version_root, &mut board, &agent)?;
-        let initial = scan(&version_root, &mut board);
-        let initial_messages: Vec<_> = initial
-            .new_messages
-            .iter()
-            .filter_map(|id| board.messages.get(id).cloned())
-            .collect();
-        let mut inbox = VecDeque::new();
-        if resumed {
-            inbox.extend(
-                initial_messages
-                    .iter()
-                    .filter(|message| message_is_relevant(&board, &agent, message))
-                    .cloned(),
-            );
-        } else {
-            acknowledge_messages(&version_root, &mut board, &initial_messages)?;
-        }
-        if !initial.warnings.is_empty() {
-            eprintln!(
-                "zboard: initial scan warnings: {}",
-                initial.warnings.join("; ")
-            );
-        }
         Ok(Self {
-            version_root,
-            agent,
+            root: client.root,
+            agent: client.agent,
             poll_interval: options.poll_interval,
-            inner: Arc::new(Mutex::new(Inner {
-                board,
-                inbox,
-                pending_ack: Vec::new(),
-            })),
+            inbox_seen: Arc::new(Mutex::new(BTreeSet::new())),
             tool_router: Self::tool_router(),
         })
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Inner>, String> {
-        self.inner
-            .lock()
-            .map_err(|_| "Zboard state lock is poisoned".to_owned())
+    fn client(&self) -> Result<Client, String> {
+        touch_presence(&self.root.join("v1"), &self.agent.id).map_err(error)?;
+        self.read_client()
     }
 
-    fn refresh(&self, inner: &mut Inner) -> Vec<String> {
-        let result = scan(&self.version_root, &mut inner.board);
-        for id in result.new_messages {
-            if let Some(message) = inner.board.messages.get(&id)
-                && message_is_relevant(&inner.board, &self.agent, message)
-            {
-                inner.inbox.push_back(message.clone());
-            }
-        }
-        result.warnings
+    fn read_client(&self) -> Result<Client, String> {
+        Ok(Client {
+            root: self.root.clone(),
+            agent: self.agent.clone(),
+            state: query::snapshot(&self.root).map_err(error)?,
+        })
     }
 
-    fn touch(&self, inner: &mut Inner) -> Result<(), String> {
-        let presence = touch_presence(&self.version_root, &self.agent.id)
-            .map_err(|error| format!("{error:#}"))?;
-        inner.board.presence.insert(self.agent.id.clone(), presence);
-        Ok(())
-    }
-
-    fn validate_send(&self, board: &BoardState, input: &SendInput) -> Result<()> {
-        if let Some(group) = input.group.as_deref() {
-            if group != "global" && group != format!("project:{}", self.agent.project) {
-                if !board.groups.contains_key(group) {
-                    bail!("unknown group '{group}'");
-                }
-                if !board
-                    .memberships
-                    .contains(&(group.to_owned(), self.agent.id.clone()))
-                {
-                    bail!("join group '{group}' before sending to it");
-                }
-            }
-        } else if input.to.is_empty() {
-            bail!("provide at least one recipient or a group");
-        } else {
-            let unknown: Vec<_> = input
-                .to
-                .iter()
-                .filter(|recipient| !board.agents.contains_key(recipient.as_str()))
-                .collect();
-            if !unknown.is_empty() {
-                bail!("unknown recipient(s): {unknown:?}");
-            }
-        }
-        Ok(())
+    fn history(&self, input: &HistoryQuery) -> Result<Json<Value>, String> {
+        let client = self.client()?;
+        output(query::history(&self.root, &client.state, &self.agent, input).map_err(error)?)
     }
 }
 
@@ -230,75 +136,54 @@ impl ZboardServer {
 impl ZboardServer {
     #[tool(
         name = "identity",
-        description = "Return this Zboard agent's registered identity"
+        description = "Return this conversation's registered identity"
     )]
-    fn identity(&self) -> Result<Json<IdentityOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        Ok(Json(IdentityOutput {
-            agent: self.agent.clone(),
-        }))
+    fn identity(&self) -> Result<Json<Value>, String> {
+        touch_presence(&self.root.join("v1"), &self.agent.id).map_err(error)?;
+        Ok(Json(json!({"agent": self.agent})))
     }
 
     #[tool(
         name = "ping",
         description = "Renew this agent's one-minute online presence"
     )]
-    fn ping(&self) -> Result<Json<IdentityOutput>, String> {
+    fn ping(&self) -> Result<Json<Value>, String> {
         self.identity()
     }
 
     #[tool(
         name = "agents_list",
-        description = "List agents registered on the shared board"
+        description = "Discover agents filtered by project, online status, or text"
     )]
-    fn agents_list(&self) -> Result<Json<AgentsOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        self.refresh(&mut inner);
-        Ok(Json(AgentsOutput {
-            agents: agent_statuses(&inner.board),
-        }))
+    fn agents_list(
+        &self,
+        Parameters(input): Parameters<AgentQuery>,
+    ) -> Result<Json<Value>, String> {
+        let client = self.client()?;
+        output(query::agents(&client.state, &input).map_err(error)?)
     }
 
     #[tool(
         name = "groups_list",
-        description = "List groups and their registered members"
+        description = "Discover groups, optionally filtering joined groups or names"
     )]
-    fn groups_list(&self) -> Result<Json<GroupsOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        self.refresh(&mut inner);
-        let groups = inner
-            .board
-            .groups
-            .values()
-            .map(|group| GroupOutput {
-                name: group.name.clone(),
-                created_by: group.created_by.clone(),
-                members: group_members(&inner.board, &group.name)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-            })
-            .collect();
-        Ok(Json(GroupsOutput { groups }))
+    fn groups_list(
+        &self,
+        Parameters(input): Parameters<GroupQuery>,
+    ) -> Result<Json<Value>, String> {
+        let client = self.client()?;
+        output(query::groups(&client.state, &self.agent, &input).map_err(error)?)
     }
 
     #[tool(
         name = "tags_list",
         description = "List every tag historically used on this board"
     )]
-    fn tags_list(&self) -> Result<Json<TagsOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        crate::routed::tags(
-            self.version_root
-                .parent()
-                .ok_or_else(|| "v1 has no board root".to_owned())?,
-        )
-        .map(|tags| Json(TagsOutput { tags }))
-        .map_err(|error| format!("{error:#}"))
+    fn tags_list(&self) -> Result<Json<Value>, String> {
+        self.identity()?;
+        Ok(Json(
+            json!({"tags": crate::routed::tags(&self.root).map_err(error)?}),
+        ))
     }
 
     #[tool(
@@ -307,214 +192,230 @@ impl ZboardServer {
     )]
     fn group_create(
         &self,
-        Parameters(GroupInput { name }): Parameters<GroupInput>,
-    ) -> Result<Json<GroupOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        self.refresh(&mut inner);
-        let group = create_group(&self.version_root, &name, &self.agent.id)
-            .map_err(|error| format!("{error:#}"))?;
-        inner.board.groups.insert(group.name.clone(), group.clone());
-        Ok(Json(GroupOutput {
-            name: group.name,
-            created_by: group.created_by,
-            members: Vec::new(),
-        }))
+        Parameters(input): Parameters<GroupInput>,
+    ) -> Result<Json<Value>, String> {
+        self.identity()?;
+        let group =
+            create_group(&self.root.join("v1"), &input.name, &self.agent.id).map_err(error)?;
+        Ok(Json(
+            json!({"name": group.name, "created_by": group.created_by, "members": []}),
+        ))
     }
 
     #[tool(
         name = "group_join",
         description = "Join an existing collaboration group idempotently"
     )]
-    fn group_join(
-        &self,
-        Parameters(GroupInput { name }): Parameters<GroupInput>,
-    ) -> Result<Json<GroupOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        self.refresh(&mut inner);
-        let membership = join_group(&self.version_root, &name, &self.agent.id)
-            .map_err(|error| format!("{error:#}"))?;
-        inner
-            .board
-            .memberships
-            .insert((membership.group.clone(), membership.agent));
-        let group = inner
-            .board
+    fn group_join(&self, Parameters(input): Parameters<GroupInput>) -> Result<Json<Value>, String> {
+        self.identity()?;
+        join_group(&self.root.join("v1"), &input.name, &self.agent.id).map_err(error)?;
+        let client = self.client()?;
+        let group = client
+            .state
             .groups
-            .get(&name)
-            .ok_or_else(|| format!("unknown group '{name}'"))?;
-        Ok(Json(GroupOutput {
-            name: group.name.clone(),
-            created_by: group.created_by.clone(),
-            members: group_members(&inner.board, &name)
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        }))
+            .get(&input.name)
+            .ok_or_else(|| "group was not visible after joining".to_owned())?;
+        Ok(Json(
+            json!({"name": group.name, "created_by": group.created_by, "members": group_members(&client.state, &input.name)}),
+        ))
     }
 
     #[tool(
         name = "message_send",
-        description = "Send a direct or group message; provide exactly one target form"
+        description = "Persist a direct or group message and return its ID; reuse an idempotency key for uncertain retries"
     )]
     fn message_send(
         &self,
         Parameters(input): Parameters<SendInput>,
-    ) -> Result<Json<MessageOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        self.refresh(&mut inner);
-        self.validate_send(&inner.board, &input)
-            .map_err(|error| format!("{error:#}"))?;
-        let message = publish_message(
-            &self.version_root,
-            &self.agent.id,
-            MessageDraft {
+    ) -> Result<Json<Value>, String> {
+        let message = self
+            .client()?
+            .send(SendRequest {
                 to: input.to,
                 group: input.group,
-                thread: None,
-                reply_to: None,
-                body: input.message,
+                message: input.message,
                 tags: input.tags,
                 meta: input.meta,
                 ttl_seconds: input.ttl_seconds,
-            },
-        )
-        .map_err(|error| format!("{error:#}"))?;
-        acknowledge_messages(
-            &self.version_root,
-            &mut inner.board,
-            std::slice::from_ref(&message),
-        )
-        .map_err(|error| format!("{error:#}"))?;
-        inner
-            .board
-            .messages
-            .insert(message.id.clone(), message.clone());
-        Ok(Json(MessageOutput { message }))
+                idempotency_key: input.idempotency_key,
+            })
+            .map_err(error)?;
+        Ok(Json(json!({"message": message})))
     }
 
     #[tool(
         name = "message_reply",
-        description = "Reply to a message while preserving its thread and participants"
+        description = "Persist a reply preserving thread and participants; return the persisted message"
     )]
     fn message_reply(
         &self,
         Parameters(input): Parameters<ReplyInput>,
-    ) -> Result<Json<MessageOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        self.refresh(&mut inner);
-        let parent = inner
-            .board
-            .messages
-            .get(&input.message_id)
-            .cloned()
-            .ok_or_else(|| format!("unknown message '{}'", input.message_id))?;
-        let group = parent.group.clone();
-        let recipients = if group.is_some() {
-            Vec::new()
-        } else {
-            direct_reply_recipients(&parent, &self.agent.id)
-        };
-        if group.is_none() && recipients.is_empty() {
-            return Err("reply has no participant other than the current agent".to_owned());
-        }
-        let message = publish_message(
-            &self.version_root,
-            &self.agent.id,
-            MessageDraft {
-                to: recipients,
-                group,
-                thread: Some(parent.thread),
-                reply_to: Some(parent.id),
-                body: input.message,
-                tags: input.tags.unwrap_or(parent.tags),
+    ) -> Result<Json<Value>, String> {
+        let message = self
+            .client()?
+            .reply(ReplyRequest {
+                message_id: input.message_id,
+                message: input.message,
+                tags: input.tags,
                 meta: input.meta,
                 ttl_seconds: input.ttl_seconds,
-            },
+                idempotency_key: input.idempotency_key,
+            })
+            .map_err(error)?;
+        Ok(Json(json!({"message": message})))
+    }
+
+    #[tool(
+        name = "message_get",
+        description = "Read one or several relevant messages by exact IDs without consuming notifications"
+    )]
+    fn message_get(&self, Parameters(input): Parameters<GetInput>) -> Result<Json<Value>, String> {
+        let client = self.client()?;
+        output(
+            query::messages_get(&self.root, &client.state, &self.agent, &input.ids)
+                .map_err(error)?,
         )
-        .map_err(|error| format!("{error:#}"))?;
-        acknowledge_messages(
-            &self.version_root,
-            &mut inner.board,
-            std::slice::from_ref(&message),
-        )
-        .map_err(|error| format!("{error:#}"))?;
-        inner
-            .board
-            .messages
-            .insert(message.id.clone(), message.clone());
-        Ok(Json(MessageOutput { message }))
     }
 
     #[tool(
         name = "message_history",
-        description = "Read relevant messages, optionally from one thread or joined group, newest window last"
+        description = "Read a bounded relevant message page with thread, group, sender, tags and cursor filters"
     )]
     fn message_history(
         &self,
-        Parameters(input): Parameters<HistoryInput>,
-    ) -> Result<Json<MessagesOutput>, String> {
-        let mut inner = self.lock()?;
-        self.touch(&mut inner)?;
-        let mut warnings = self.refresh(&mut inner);
-        let limit = input.limit.unwrap_or(50).min(1_000);
-        let tags = normalize_tags(input.tags).map_err(|error| format!("{error:#}"))?;
-        let (messages, history_warnings) = relevant_history(
-            &self.version_root,
-            &inner.board,
-            &self.agent,
-            crate::routed::HistoryFilter {
-                thread: input.thread.as_deref(),
-                group: input.group.as_deref(),
-                sender: input.sender.as_deref(),
-                tags: &tags,
-                limit,
-            },
-        );
-        warnings.extend(history_warnings);
-        Ok(Json(MessagesOutput { messages, warnings }))
+        Parameters(input): Parameters<HistoryQuery>,
+    ) -> Result<Json<Value>, String> {
+        self.history(&input)
+    }
+
+    #[tool(
+        name = "message_history_page",
+        description = "Read history pages; pass next_cursor as before for older history or after for forward reads"
+    )]
+    fn message_history_page(
+        &self,
+        Parameters(input): Parameters<HistoryQuery>,
+    ) -> Result<Json<Value>, String> {
+        self.history(&input)
+    }
+
+    #[tool(
+        name = "message_search",
+        description = "Search relevant message text with optional group, sender, tags and page filters"
+    )]
+    fn message_search(
+        &self,
+        Parameters(input): Parameters<HistoryQuery>,
+    ) -> Result<Json<Value>, String> {
+        if input
+            .search
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+        {
+            return Err("provide nonempty search text".to_owned());
+        }
+        self.history(&input)
+    }
+
+    #[tool(
+        name = "message_thread",
+        description = "Resolve any message ID to its thread and return a bounded conversation page"
+    )]
+    fn message_thread(
+        &self,
+        Parameters(input): Parameters<ThreadInput>,
+    ) -> Result<Json<Value>, String> {
+        let client = self.client()?;
+        let parent =
+            query::messages_get(&self.root, &client.state, &self.agent, &[input.message_id])
+                .map_err(error)?;
+        let parent = parent
+            .messages
+            .first()
+            .ok_or_else(|| "message not found in relevant routes".to_owned())?;
+        output(
+            query::history(
+                &self.root,
+                &client.state,
+                &self.agent,
+                &HistoryQuery {
+                    thread: Some(parent.thread.clone()),
+                    before: input.before,
+                    limit: input.limit.unwrap_or(50),
+                    ..Default::default()
+                },
+            )
+            .map_err(error)?,
+        )
     }
 
     #[tool(
         name = "inbox_poll",
-        description = "Wait briefly for newly discovered relevant messages"
+        description = "Poll relevant inbox messages. No cursor examines only the newest limit messages (default 50), suppressing repeats in this process; use explicit cursors/history for older backlog. Never acknowledges wake delivery. Restart without cursor replays that recent window"
     )]
     async fn inbox_poll(
         &self,
         Parameters(input): Parameters<PollInput>,
-    ) -> Result<Json<MessagesOutput>, String> {
-        let timeout = Duration::from_millis(input.timeout_ms.unwrap_or(0).min(30_000));
-        let limit = input.limit.unwrap_or(50).clamp(1, 1_000);
-        let deadline = Instant::now() + timeout;
-        let mut warnings = Vec::new();
-        {
-            let mut inner = self.lock()?;
-            self.touch(&mut inner)?;
-            let delivered = std::mem::take(&mut inner.pending_ack);
-            if let Err(error) =
-                acknowledge_messages(&self.version_root, &mut inner.board, &delivered)
-            {
-                inner.pending_ack = delivered;
-                return Err(format!("{error:#}"));
-            }
-        }
+    ) -> Result<Json<Value>, String> {
+        let deadline =
+            Instant::now() + Duration::from_millis(input.timeout_ms.unwrap_or(0).min(30_000));
         loop {
-            {
-                let mut inner = self.lock()?;
-                warnings.extend(self.refresh(&mut inner));
-                if !inner.inbox.is_empty() || Instant::now() >= deadline {
-                    let count = limit.min(inner.inbox.len());
-                    let messages: Vec<_> = inner.inbox.drain(..count).collect();
-                    inner.pending_ack.clone_from(&messages);
-                    return Ok(Json(MessagesOutput { messages, warnings }));
+            let client = self.client()?;
+            let mut page = query::history(
+                &self.root,
+                &client.state,
+                &self.agent,
+                &HistoryQuery {
+                    after: input.cursor.clone(),
+                    limit: input.limit.unwrap_or(50),
+                    ..Default::default()
+                },
+            )
+            .map_err(error)?;
+            if input.cursor.is_none() {
+                let mut seen = self
+                    .inbox_seen
+                    .lock()
+                    .map_err(|_| "inbox state lock poisoned".to_owned())?;
+                page.messages.retain(|message| !seen.contains(&message.id));
+                seen.extend(page.messages.iter().map(|message| message.id.clone()));
+                while seen.len() > 4096 {
+                    seen.pop_first();
                 }
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            tokio::time::sleep(self.poll_interval.min(remaining)).await;
+            // History cursors page backwards by default. Inbox resumption
+            // always moves forward and must remain available at the live tail.
+            page.next_cursor = page
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .max()
+                .or_else(|| input.cursor.clone());
+            if !page.messages.is_empty() || Instant::now() >= deadline {
+                return output(page);
+            }
+            tokio::time::sleep(
+                self.poll_interval
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
         }
+    }
+
+    #[tool(
+        name = "status",
+        description = "Inspect board, identity and wake listener state without reading raw files"
+    )]
+    fn status(&self) -> Result<Json<Value>, String> {
+        Ok(Json(self.read_client()?.status().map_err(error)?))
+    }
+
+    #[tool(
+        name = "doctor",
+        description = "Diagnose board and listener problems and return actionable findings"
+    )]
+    fn doctor(&self) -> Result<Json<Value>, String> {
+        Ok(Json(self.read_client()?.doctor().map_err(error)?))
     }
 }
 
@@ -527,7 +428,7 @@ impl ServerHandler for ZboardServer {
             .with_description("Shared-filesystem coordination for AI-agent conversations")
             .with_website_url("https://github.com/zcourts/zboard");
         info.instructions = Some(format!(
-            "Coordinate only genuine cross-agent dependencies. This server is registered as {}.",
+            "Coordinate genuine cross-agent dependencies as {}. Reads never consume wake notifications. Inbox cursors are explicit; persist returned cursors to resume. Send/reply return persisted messages; use idempotency_key for uncertain retries.",
             self.agent.id
         ));
         info
@@ -535,8 +436,7 @@ impl ServerHandler for ZboardServer {
 }
 
 pub async fn serve(options: McpOptions) -> Result<()> {
-    let server = ZboardServer::new(options)?;
-    let service = server
+    let service = ZboardServer::new(options)?
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|error| anyhow!("start MCP stdio transport: {error}"))?;
@@ -549,145 +449,160 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn options(root: PathBuf, project: &str, session: &str) -> McpOptions {
-        McpOptions {
-            root,
+    #[test]
+    fn idempotent_send_retries_and_conflicting_tags_are_rejected() {
+        let dir = tempdir().unwrap();
+        let sender = server(dir.path(), "sender", "one");
+        let recipient = server(dir.path(), "recipient", "two");
+        let key = ulid::Ulid::new().to_string();
+        let request = |tags: Vec<String>| {
+            Parameters(SendInput {
+                to: vec![recipient.agent.id.clone()],
+                group: None,
+                message: "durable handoff".into(),
+                tags,
+                meta: None,
+                ttl_seconds: None,
+                idempotency_key: Some(key.clone()),
+            })
+        };
+        let first = sender
+            .message_send(request(vec!["release".into()]))
+            .unwrap()
+            .0;
+        let second = sender
+            .message_send(request(vec!["release".into()]))
+            .unwrap()
+            .0;
+        assert_eq!(first, second);
+        assert_eq!(first["message"]["id"], key);
+        assert!(sender.message_send(request(vec!["build".into()])).is_err());
+        let found = recipient
+            .message_get(Parameters(GetInput { ids: vec![key] }))
+            .unwrap()
+            .0;
+        assert_eq!(found["messages"][0]["tags"], json!(["release"]));
+    }
+
+    fn server(root: &std::path::Path, project: &str, session: &str) -> ZboardServer {
+        ZboardServer::new(McpOptions {
+            root: root.to_owned(),
             project: project.to_owned(),
             session: session.to_owned(),
-            project_path: PathBuf::from(format!("/{project}")),
-            poll_interval: Duration::from_millis(10),
-        }
+            project_path: root.to_owned(),
+            poll_interval: Duration::from_millis(5),
+        })
+        .unwrap()
     }
 
     #[test]
-    fn direct_message_reaches_recipient_inbox() {
-        let directory = tempdir().unwrap();
-        let sender =
-            ZboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
-        let recipient =
-            ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
-
-        sender
+    fn direct_send_get_reply_and_filters_share_api() {
+        let dir = tempdir().unwrap();
+        let sender = server(dir.path(), "sender", "one");
+        let recipient = server(dir.path(), "recipient", "two");
+        let sent = sender
             .message_send(Parameters(SendInput {
                 to: vec![recipient.agent.id.clone()],
                 group: None,
-                message: "handoff".to_owned(),
-                tags: vec!["release".to_owned()],
-                meta: Some(serde_json::json!({"schema":"example.v1","count":2})),
+                message: "handoff".into(),
+                tags: vec!["release".into()],
+                meta: Some(json!({"count": 2})),
                 ttl_seconds: None,
+                idempotency_key: None,
             }))
-            .unwrap();
-
-        let mut inner = recipient.lock().unwrap();
-        assert!(recipient.refresh(&mut inner).is_empty());
-        let received = inner.inbox.pop_front().unwrap();
-        assert_eq!(received.message, "handoff");
-        assert_eq!(
-            received.meta,
-            Some(serde_json::json!({"schema":"example.v1","count":2}))
-        );
-        assert_eq!(received.from, sender.agent.id);
-        assert_eq!(received.tags, vec!["release"]);
-        assert_eq!(
-            sender.tags_list().unwrap().0.tags,
-            vec!["release".to_owned()]
-        );
-    }
-
-    #[test]
-    fn group_send_requires_membership() {
-        let directory = tempdir().unwrap();
-        let server =
-            ZboardServer::new(options(directory.path().to_owned(), "infra", "one")).unwrap();
-        let mut inner = server.lock().unwrap();
-        let group = create_group(&server.version_root, "release", &server.agent.id).unwrap();
-        inner.board.groups.insert(group.name.clone(), group);
-        let input = SendInput {
-            to: Vec::new(),
-            group: Some("release".to_owned()),
-            message: "ready".to_owned(),
-            tags: Vec::new(),
-            meta: None,
-            ttl_seconds: None,
-        };
-        assert!(server.validate_send(&inner.board, &input).is_err());
-    }
-
-    #[test]
-    fn restart_delivers_messages_received_while_offline() {
-        let directory = tempdir().unwrap();
-        let recipient_options = options(directory.path().to_owned(), "infra", "two");
-        let recipient = ZboardServer::new(recipient_options).unwrap();
-        let recipient_id = recipient.agent.id.clone();
-        drop(recipient);
-        let sender =
-            ZboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
-        sender
-            .message_send(Parameters(SendInput {
-                to: vec![recipient_id],
-                group: None,
-                message: "while offline".to_owned(),
-                tags: Vec::new(),
+            .unwrap()
+            .0;
+        let id = sent["message"]["id"].as_str().unwrap().to_owned();
+        let got = recipient
+            .message_get(Parameters(GetInput {
+                ids: vec![id.clone()],
+            }))
+            .unwrap()
+            .0;
+        assert_eq!(got["messages"][0]["message"], "handoff");
+        assert_eq!(got["messages"][0]["meta"]["count"], 2);
+        let reply = recipient
+            .message_reply(Parameters(ReplyInput {
+                message_id: id.clone(),
+                message: "received".into(),
+                tags: None,
                 meta: None,
                 ttl_seconds: None,
+                idempotency_key: None,
             }))
-            .unwrap();
-
-        let resumed =
-            ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
-        let inner = resumed.lock().unwrap();
-        assert_eq!(inner.inbox.len(), 1);
-        assert_eq!(inner.inbox[0].message, "while offline");
+            .unwrap()
+            .0;
+        assert_eq!(reply["message"]["reply_to"], id);
+        assert_eq!(reply["message"]["tags"][0], "release");
+        let thread = sender
+            .message_thread(Parameters(ThreadInput {
+                message_id: id,
+                before: None,
+                limit: None,
+            }))
+            .unwrap()
+            .0;
+        assert_eq!(thread["messages"].as_array().unwrap().len(), 2);
+        let found = recipient
+            .message_search(Parameters(HistoryQuery {
+                search: Some("handoff".into()),
+                ..Default::default()
+            }))
+            .unwrap()
+            .0;
+        assert_eq!(found["messages"].as_array().unwrap().len(), 1);
     }
 
     #[test]
-    fn mcp_poll_acknowledges_only_after_the_next_poll() {
+    fn mcp_reads_do_not_change_listener_checkpoint() {
+        let dir = tempdir().unwrap();
+        let recipient = server(dir.path(), "recipient", "two");
+        let sender = server(dir.path(), "sender", "one");
+        let version_root = dir.path().join("v1");
+        let mut listener = crate::storage::BoardState::default();
+        crate::storage::initialize_routing(&version_root, &mut listener, &recipient.agent).unwrap();
+        let sent = sender
+            .message_send(Parameters(SendInput {
+                to: vec![recipient.agent.id.clone()],
+                group: None,
+                message: "independent".into(),
+                tags: vec![],
+                meta: None,
+                ttl_seconds: None,
+                idempotency_key: None,
+            }))
+            .unwrap()
+            .0;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let directory = tempdir().unwrap();
-            let recipient_options = options(directory.path().to_owned(), "infra", "two");
-            let recipient = ZboardServer::new(recipient_options).unwrap();
-            let recipient_id = recipient.agent.id.clone();
-            let sender =
-                ZboardServer::new(options(directory.path().to_owned(), "worka", "one")).unwrap();
-            sender
-                .message_send(Parameters(SendInput {
-                    to: vec![recipient_id],
-                    group: None,
-                    message: "at least once".to_owned(),
-                    tags: Vec::new(),
-                    meta: None,
-                    ttl_seconds: None,
-                }))
-                .unwrap();
-
             let first = recipient
                 .inbox_poll(Parameters(PollInput::default()))
                 .await
-                .unwrap();
-            assert_eq!(first.0.messages.len(), 1);
-            drop(recipient);
-
-            let resumed =
-                ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
-            let replayed = resumed
+                .unwrap()
+                .0;
+            assert_eq!(first["messages"][0]["id"], sent["message"]["id"]);
+            assert_eq!(first["next_cursor"], sent["message"]["id"]);
+            let second = recipient
                 .inbox_poll(Parameters(PollInput::default()))
                 .await
-                .unwrap();
-            assert_eq!(replayed.0.messages.len(), 1);
-            let acknowledged = resumed
+                .unwrap()
+                .0;
+            assert!(second["messages"].as_array().unwrap().is_empty());
+            let restarted = server(dir.path(), "recipient", "two");
+            let again = restarted
                 .inbox_poll(Parameters(PollInput::default()))
                 .await
-                .unwrap();
-            assert!(acknowledged.0.messages.is_empty());
-            drop(resumed);
-
-            let final_restart =
-                ZboardServer::new(options(directory.path().to_owned(), "infra", "two")).unwrap();
-            assert!(final_restart.lock().unwrap().inbox.is_empty());
+                .unwrap()
+                .0;
+            assert_eq!(again["messages"][0]["id"], sent["message"]["id"]);
         });
+        let scan = crate::storage::scan(&version_root, &mut listener);
+        assert!(
+            scan.new_messages
+                .contains(&sent["message"]["id"].as_str().unwrap().to_owned())
+        );
     }
 }

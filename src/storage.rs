@@ -183,6 +183,16 @@ pub struct MessageDraft {
 }
 
 pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> Result<Message> {
+    publish_message_with_id(version_root, from, draft, None)
+}
+
+/// A caller-supplied ULID is both the immutable message identity and retry key.
+pub fn publish_message_with_id(
+    version_root: &Path,
+    from: &str,
+    draft: MessageDraft,
+    request_id: Option<&str>,
+) -> Result<Message> {
     let MessageDraft {
         to,
         group,
@@ -202,20 +212,28 @@ pub fn publish_message(version_root: &Path, from: &str, draft: MessageDraft) -> 
     }
     let tags = normalize_tags(tags)?;
 
+    let id = match request_id {
+        Some(id) => id
+            .parse::<Ulid>()
+            .context("idempotency key must be a ULID")?,
+        None => next_ulid(),
+    };
+    let created = chrono::DateTime::from_timestamp_millis(id.timestamp_ms() as i64)
+        .context("message timestamp is out of range")?;
     let expires_at = ttl_seconds
         .map(|seconds| {
             let seconds = i64::try_from(seconds).context("message TTL is too large")?;
-            Utc::now()
+            created
                 .checked_add_signed(chrono::Duration::seconds(seconds))
                 .context("message expiry is out of range")
                 .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         })
         .transpose()?;
-    let id = next_ulid().to_string();
+    let id = id.to_string();
     let message = Message {
         schema: MESSAGE_SCHEMA.to_owned(),
         id: id.clone(),
-        timestamp: timestamp(),
+        timestamp: created.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         from: from.to_owned(),
         to,
         group,
@@ -320,6 +338,18 @@ pub fn scan(version_root: &Path, state: &mut BoardState) -> ScanResult {
     }
     result.new_messages.sort();
     routed::trim_cache(&mut state.messages);
+    result
+}
+
+/// Refresh discovery metadata without consuming messages or touching checkpoints.
+pub fn scan_metadata(version_root: &Path, state: &mut BoardState) -> ScanResult {
+    let mut result = ScanResult {
+        new_messages: Vec::new(),
+        warnings: Vec::new(),
+    };
+    scan_agents(version_root, state, &mut result);
+    scan_groups(version_root, state, &mut result);
+    scan_presence(version_root, state, &mut result);
     result
 }
 

@@ -1,6 +1,9 @@
 mod app;
+mod cli;
+mod client;
 mod mcp;
 mod model;
+mod query;
 mod routed;
 mod storage;
 mod wake;
@@ -31,7 +34,7 @@ fn try_main() -> Result<()> {
             print_help();
             Ok(())
         }
-        Some(command) => bail!("unknown command '{command}'; expected 'run', 'mcp', or 'migrate'"),
+        Some(command) => cli::command(std::iter::once(command.to_owned()).chain(args)),
     }
 }
 
@@ -172,6 +175,7 @@ fn run_command(mut args: impl Iterator<Item = String>) -> Result<()> {
 }
 
 fn print_help() {
+    println!("{}", cli::help());
     println!(
         "zboard - shared-filesystem message board for AI agents\n\n\
          USAGE:\n  zboard run --project <slug> [OPTIONS]\n  zboard mcp [OPTIONS]\n  zboard migrate [--root <path>]\n  zboard wake --events <jsonl> --state <checkpoint> --agent <id> --thread <uuid> --codex <binary>\n\n\

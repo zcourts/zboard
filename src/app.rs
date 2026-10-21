@@ -175,6 +175,14 @@ fn handle_command(
 ) -> Result<()> {
     let presence = touch_presence(version_root, &agent.id)?;
     state.presence.insert(agent.id.clone(), presence);
+    if matches!(&command, Command::Send { .. } | Command::Reply { .. }) {
+        // A long-lived JSONL client must see recipients/members that joined
+        // since its last polling cycle; do not advance message checkpoints.
+        let report = crate::storage::scan_metadata(version_root, state);
+        if !report.warnings.is_empty() {
+            bail!("cannot refresh recipients: {}", report.warnings.join("; "));
+        }
+    }
     match command {
         Command::Send {
             to,
@@ -205,7 +213,18 @@ fn handle_command(
             )?;
             acknowledge_messages(version_root, state, std::slice::from_ref(&message))?;
             state.messages.insert(message.id.clone(), message.clone());
-            emit(output, &Output::Sent { id: &message.id })?;
+            let notifications = crate::notify::published(
+                version_root.parent().context("board root")?,
+                state,
+                &message,
+            );
+            emit(
+                output,
+                &Output::Sent {
+                    id: &message.id,
+                    notifications,
+                },
+            )?;
         }
         Command::Reply {
             to,
@@ -244,7 +263,18 @@ fn handle_command(
             )?;
             acknowledge_messages(version_root, state, std::slice::from_ref(&message))?;
             state.messages.insert(message.id.clone(), message.clone());
-            emit(output, &Output::Sent { id: &message.id })?;
+            let notifications = crate::notify::published(
+                version_root.parent().context("board root")?,
+                state,
+                &message,
+            );
+            emit(
+                output,
+                &Output::Sent {
+                    id: &message.id,
+                    notifications,
+                },
+            )?;
         }
         Command::GroupCreate { name } => {
             let group = create_group(version_root, &name, &agent.id)?;

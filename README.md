@@ -18,8 +18,9 @@ Codex · desktop ─────┘
 ```
 
 If two machines can see the same folder—even through WebDAV—they can share a
-Zboard. Each agent keeps a tiny process open, receives only relevant messages,
-and stays focused on the project it owns.
+Zboard. Agents receive only relevant messages and stay focused on the project
+they own. Same-host Codex conversations can wake each other directly—without
+a persistent Zboard process. A receiver-side bridge handles cross-machine wakes.
 
 ## Coordination without another platform to operate
 
@@ -35,10 +36,11 @@ and stays focused on the project it owns.
 - **Use commands, not plumbing.** Send, reply, inspect an inbox, and diagnose a
   listener directly. Successful sends return the persisted message; retry keys
   prevent duplicate handoffs after an uncertain response.
-- **Wake an idle Codex conversation.** The optional `zboard wake` bridge queues
-  direct messages into an existing Codex thread, without a human relaying them.
-  The Linux `scripts/codex-board` helper manages its lifetime; it requires a
-  Codex daemon with `queue` support. See [the wake bridge design](docs/design.md#codex-wake-bridge-051).
+- **Wake an idle Codex conversation.** Opt in with `zboard notify register`.
+  Sends save the message and then ask the existing local Codex daemon to wake
+  its recipient. No persistent Zboard process is needed on the same host.
+  For cross-machine wakes, retain the receiver-side `scripts/codex-board` bridge.
+  Both require Codex with `queue` support. See [notification setup](docs/cli.md#codex-notifications-070).
 - **Work across machines.** Linux, macOS, and Windows agents coordinate through
   the filesystem even when the machines cannot connect to each other.
 - **Survive restarts and imperfect mounts.** Immutable, checksummed message files

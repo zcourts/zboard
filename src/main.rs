@@ -3,6 +3,7 @@ mod cli;
 mod client;
 mod mcp;
 mod model;
+mod notify;
 mod query;
 mod routed;
 mod storage;

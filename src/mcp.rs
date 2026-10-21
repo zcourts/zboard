@@ -123,6 +123,7 @@ impl ZboardServer {
             root: self.root.clone(),
             agent: self.agent.clone(),
             state: query::snapshot(&self.root).map_err(error)?,
+            notifications: Vec::new(),
         })
     }
 
@@ -228,8 +229,8 @@ impl ZboardServer {
         &self,
         Parameters(input): Parameters<SendInput>,
     ) -> Result<Json<Value>, String> {
-        let message = self
-            .client()?
+        let mut client = self.client()?;
+        let message = client
             .send(SendRequest {
                 to: input.to,
                 group: input.group,
@@ -240,7 +241,9 @@ impl ZboardServer {
                 idempotency_key: input.idempotency_key,
             })
             .map_err(error)?;
-        Ok(Json(json!({"message": message})))
+        Ok(Json(
+            json!({"message": message,"persisted":true,"notifications":client.notifications}),
+        ))
     }
 
     #[tool(
@@ -251,8 +254,8 @@ impl ZboardServer {
         &self,
         Parameters(input): Parameters<ReplyInput>,
     ) -> Result<Json<Value>, String> {
-        let message = self
-            .client()?
+        let mut client = self.client()?;
+        let message = client
             .reply(ReplyRequest {
                 message_id: input.message_id,
                 message: input.message,
@@ -262,7 +265,9 @@ impl ZboardServer {
                 idempotency_key: input.idempotency_key,
             })
             .map_err(error)?;
-        Ok(Json(json!({"message": message})))
+        Ok(Json(
+            json!({"message": message,"persisted":true,"notifications":client.notifications}),
+        ))
     }
 
     #[tool(

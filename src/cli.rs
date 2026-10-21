@@ -203,7 +203,13 @@ fn open(args: &Arguments, command: &str) -> Result<Client> {
             _ => bail!("session belongs to multiple projects; set --identity-project"),
         }
     };
-    if matches!(command, "send" | "reply" | "ping" | "group" | "identity") {
+    if command == "notify" && args.words.get(1).is_some_and(|s| s == "status") {
+        return Client::read_only(&root, &project, &session, &path);
+    }
+    if matches!(
+        command,
+        "send" | "reply" | "ping" | "group" | "identity" | "notify"
+    ) {
         Client::open(&root, &project, &session, &path)
     } else {
         Client::read_only(&root, &project, &session, &path)
@@ -328,6 +334,50 @@ fn execute(args: &Arguments) -> Result<Value> {
     }
     let mut client = open(args, verb)?;
     match verb {
+        "notify" => {
+            args.validate(&["--codex"], &[])?;
+            match args.words.get(1).map(String::as_str) {
+                Some("register") => {
+                    args.words(2)?;
+                    Ok(serde_json::to_value(crate::notify::register(
+                        &client.root,
+                        &client.agent,
+                        args.get("--codex").map(PathBuf::from),
+                    )?)?)
+                }
+                Some("unregister") => {
+                    args.words(2)?;
+                    crate::notify::unregister(&client.root, &client.agent.id)?;
+                    Ok(json!({"registered":false}))
+                }
+                Some("status") => {
+                    args.words(2)?;
+                    Ok(
+                        json!({"registration":crate::notify::registration(&client.root, &client.agent.id)?}),
+                    )
+                }
+                Some("retry") => {
+                    args.words(3)?;
+                    let found = query::messages_get(
+                        &client.root,
+                        &client.state,
+                        &client.agent,
+                        &[args.words[2].clone()],
+                    )?;
+                    let message = found
+                        .messages
+                        .first()
+                        .context("message missing or not relevant")?;
+                    if message.from != client.agent.id {
+                        bail!("only the sender can retry fanout notifications");
+                    }
+                    Ok(
+                        json!({"id":message.id,"persisted":true,"notifications":crate::notify::published(&client.root, &client.state, message)}),
+                    )
+                }
+                _ => bail!("expected notify register|unregister|status|retry ID"),
+            }
+        }
         "watch" => watch(&mut client, args),
         "send" | "reply" => {
             let mut allowed = vec![
@@ -392,7 +442,9 @@ fn execute(args: &Arguments) -> Result<Value> {
                     "send outcome unconfirmed; retry the same request with --idempotency-key {key}"
                 )
             })?;
-            Ok(json!({"persisted":true,"id":message.id,"idempotency_key":key,"message":message}))
+            Ok(
+                json!({"persisted":true,"id":message.id,"idempotency_key":key,"message":message,"notifications":client.notifications}),
+            )
         }
         "message" => {
             args.validate(&[], &[])?;
@@ -532,6 +584,8 @@ pub fn help() -> &'static str {
      message get ID [ID ...]\n\
      send (--to AGENT [--to AGENT ...] | --group GROUP) --message TEXT\n\
      reply ID --message TEXT [--clear-tags]\n\
+     notify register [--codex /absolute/path/to/codex] | notify unregister\n\
+     notify status | notify retry MESSAGE_ID\n\
        send/reply: [--tag TAG ...] [--meta-json JSON | --meta-file PATH]\n\
                    [--ttl-seconds N] [--idempotency-key ULID]\n\
      history | inbox | search TEXT | thread ID\n\

@@ -576,3 +576,21 @@ the skill/plugin bundle, and `SHA256SUMS`. The storage, MCP, and JSONL protocols
 remain platform-neutral, and `notify` selects the appropriate native backend
 while the polling path remains universal. The Debian ARM64 binary is
 additionally qualified locally before publication.
+
+## Direct local Codex notification (0.7.0)
+
+The approved local fast path keeps shared message publication authoritative.
+After publication, each send/reply entrypoint resolves eligible recipients
+against current membership and checks an explicitly registered, host-local
+Codex thread mapping. It invokes the existing Codex daemon's queue command
+directly; Zboard does not introduce a second daemon, shared lock, transport, or
+message format. Local registrations and delivery receipts are scoped by
+canonical board path and OS user, and never replicated to other hosts.
+
+The cross-VM receiver bridge remains necessary for automatic notifications
+originating elsewhere. Both delivery paths use the same recipient lock and
+per-message receipt. Failed queue calls leave the message and retry path intact;
+a crash between queue acceptance and receipt persistence permits redelivery.
+This is not an exactly-once execution guarantee. Explicit unregister stops new
+registrations being resolved, but cannot recall an in-flight queue call.
+See the CLI guide for bounded send latency, retry statuses and upgrade steps.

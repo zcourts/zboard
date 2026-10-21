@@ -38,6 +38,7 @@ pub struct Client {
     pub root: PathBuf,
     pub agent: Agent,
     pub state: BoardState,
+    pub notifications: Vec<crate::notify::Delivery>,
 }
 
 impl Client {
@@ -56,6 +57,7 @@ impl Client {
             root: root.to_path_buf(),
             agent,
             state,
+            notifications: Vec::new(),
         })
     }
 
@@ -69,6 +71,7 @@ impl Client {
             root: root.to_path_buf(),
             agent,
             state,
+            notifications: Vec::new(),
         })
     }
 
@@ -188,7 +191,10 @@ impl Client {
             )?;
             Ok(message)
         })();
-        result.with_context(|| format!("request_id={id}; retry the same payload with this idempotency key after fixing the error"))
+        let message = result.with_context(|| format!("request_id={id}; retry the same payload with this idempotency key after fixing the error"))?;
+        // The sender request lock is released before potentially slow daemon I/O.
+        self.notifications = crate::notify::published(&self.root, &self.state, &message);
+        Ok(message)
     }
 
     pub fn status(&self) -> Result<Value> {
@@ -215,6 +221,7 @@ impl Client {
             .and_then(|v| v.get("offset"))
             .and_then(Value::as_u64);
         Ok(json!({"agent": self.agent, "board_root": self.root,
+            "local_notification": crate::notify::registration(&self.root, &self.agent.id)?,
             "listener_checkpoint_untouched": true,
             "wake": {"configured": wake.is_some(), "lock_held": lock_held,
                 "state_directory": path, "event_bytes": bytes, "queued_offset": offset,

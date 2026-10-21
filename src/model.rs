@@ -129,7 +129,10 @@ pub enum Output<'a> {
         latest: Option<&'a str>,
     },
     #[serde(rename = "sent")]
-    Sent { id: &'a str },
+    Sent {
+        id: &'a str,
+        notifications: Vec<crate::notify::Delivery>,
+    },
     #[serde(rename = "message")]
     Incoming { message: &'a Message },
     #[serde(rename = "agents")]

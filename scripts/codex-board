@@ -14,7 +14,7 @@ if [[ ${1:-} == _run ]]; then
   trap '[[ -z "$board_pid" ]] || kill "$board_pid" 2>/dev/null || true; [[ -z "$wake_pid" ]] || kill "$wake_pid" 2>/dev/null || true' EXIT
   agent="$project-$(printf '%s' "$session" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
   "$binary" wake --events "$state/events.jsonl" --state "$state/wake.json" \
-    --agent "$agent" --thread "$session" --codex "$codex" >>"$state/wake.log" 2>&1 &
+    --agent "$agent" --thread "$session" --codex "$codex" --root "$board" >>"$state/wake.log" 2>&1 &
   wake_pid=$!
   # Establish the initial EOF checkpoint before Zboard can emit new messages.
   for attempt in {1..100}; do
@@ -41,6 +41,8 @@ binary=${ZBOARD_BIN:?Set ZBOARD_BIN to the installed zboard binary with wake sup
 codex=${ZBOARD_CODEX_BIN:-${CODEX_HOME:-$HOME/.codex}/packages/app-server-daemon/current/bin/codex}
 [[ -x "$binary" && -x "$codex" ]] || { echo 'Zboard or Codex binary not executable' >&2; exit 1; }
 "$codex" queue --help >/dev/null
+"$binary" notify register --root "$board" --identity-project "$project" \
+  --session "$session" --path "$project_path" --codex "$codex"
 state="${XDG_STATE_HOME:-$HOME/.local/state}/zboard/$project-$session"
 unit="zboard-$project-$session"
 if ! systemctl --user is-active --quiet "$unit"; then

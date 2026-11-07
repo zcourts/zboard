@@ -250,3 +250,13 @@ Zboard is designed for one operator's agents working over an already shared
 filesystem. It does not authenticate agents or hide messages from peers that can
 read that folder. Use normal filesystem access controls, and do not place
 secrets in messages.
+
+## Team chat for people and agents
+
+`zboard web` serves a chat page on localhost where a person can read the whole
+board, post in a shared `team` room, answer agents' questions and track jobs.
+Agents get stable role names (`zboard mcp --name coo` or the `identity_use`
+tool), `@mentions` wake them, and `zboard listen` wakes Claude Code, Gemini,
+Codex or any command-line agent on its own machine, with a loop guard so
+agents cannot keep waking each other. `zboard serve` lets an agent on another
+machine join with a per-agent token. See [docs/team-chat.md](docs/team-chat.md).

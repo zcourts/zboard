@@ -1,13 +1,17 @@
 mod app;
+mod board;
 mod cli;
 mod client;
+mod http;
 mod mcp;
 mod model;
 mod notify;
 mod query;
+mod remote;
 mod routed;
 mod storage;
 mod wake;
+mod web;
 
 use std::env;
 use std::path::PathBuf;
@@ -31,6 +35,11 @@ fn try_main() -> Result<()> {
         Some("mcp") => mcp_command(args),
         Some("migrate") => migrate_command(args),
         Some("wake") => wake::command(args),
+        Some("wake-exec") => notify::wake_exec(args),
+        Some("listen") => notify::listen(args),
+        Some("web") => web::command(args),
+        Some("serve") => remote::serve_command(args),
+        Some("token") => remote::token_command(args),
         Some("--help" | "-h") | None => {
             print_help();
             Ok(())
@@ -72,12 +81,25 @@ fn mcp_command(mut args: impl Iterator<Item = String>) -> Result<()> {
         .ok();
     let mut project_path = None;
     let mut poll_interval = Duration::from_secs(3);
+    // A role name beats session environment variables, which change with
+    // every Claude Code conversation.
+    let mut name = env::var("ZBOARD_AGENT_NAME").ok().filter(|v| !v.is_empty());
+    let mut join: Vec<String> = env::var("ZBOARD_JOIN")
+        .ok()
+        .map(|v| v.split(',').map(|g| g.trim().to_owned()).filter(|g| !g.is_empty()).collect())
+        .unwrap_or_default();
+    let mut remote = env::var("ZBOARD_REMOTE").ok().filter(|v| !v.is_empty());
+    let mut token = None;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--root" => root = Some(PathBuf::from(required_value(&mut args, "--root")?)),
             "--project" => project = Some(required_value(&mut args, "--project")?),
             "--session" => session = Some(required_value(&mut args, "--session")?),
+            "--name" => name = Some(required_value(&mut args, "--name")?),
+            "--join" => join.push(required_value(&mut args, "--join")?),
+            "--remote" => remote = Some(required_value(&mut args, "--remote")?),
+            "--token" => token = Some(required_value(&mut args, "--token")?),
             "--path" => project_path = Some(PathBuf::from(required_value(&mut args, "--path")?)),
             "--poll-interval" => {
                 poll_interval =
@@ -91,14 +113,31 @@ fn mcp_command(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
 
+    if let Some(url) = remote {
+        let remote = remote::Remote::new(url, token)?;
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("create MCP runtime")?
+            .block_on(mcp::serve_remote(remote));
+    }
+    for group in &join {
+        storage::validate_slug(group, "group")?;
+    }
     let project = project.unwrap_or_else(|| project_slug(&current_directory));
+    let root = root.unwrap_or_else(|| default_root(&current_directory));
+    if let Some(name) = &name {
+        board::validate_name(name)?;
+        session = Some(board::session_for_name(&root, &project, name));
+    }
     let session = session.unwrap_or_else(|| format!("mcp-{}", ulid::Ulid::new()));
     let options = mcp::McpOptions {
-        root: root.unwrap_or_else(|| default_root(&current_directory)),
+        root,
         project,
         session,
         project_path: project_path.unwrap_or(current_directory),
         poll_interval,
+        join,
     };
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -179,7 +218,7 @@ fn print_help() {
     println!("{}", cli::help());
     println!(
         "zboard - shared-filesystem message board for AI agents\n\n\
-         USAGE:\n  zboard run --project <slug> [OPTIONS]\n  zboard mcp [OPTIONS]\n  zboard migrate [--root <path>]\n  zboard wake --events <jsonl> --state <checkpoint> --agent <id> --thread <uuid> --codex <binary>\n\n\
+         USAGE:\n  zboard run --project <slug> [OPTIONS]\n  zboard mcp [OPTIONS] [--name ROLE] [--join GROUP] [--remote URL --token TOKEN]\n  zboard web [--project <slug>] [--as founder] [--port 7777]\n  zboard listen [--root <path>]   wake locally registered agents\n  zboard serve [--listen ADDR:PORT] [--allow-public]\n  zboard token create --project <slug> --session NAME | token list | token revoke LABEL\n  zboard migrate [--root <path>]\n  zboard wake --events <jsonl> --state <checkpoint> --agent <id> --thread <uuid> --codex <binary>\n\n\
          OPTIONS:\n  --root <path>           Board root; defaults to ZBOARD_ROOT or ancestor .ai/message-board\n  \
          --project <slug>       Agent project; MCP also defaults to the current directory name\n  \
          --session <id>         Stable session; uses known agent session environment variables\n  \

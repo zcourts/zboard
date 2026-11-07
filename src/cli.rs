@@ -48,7 +48,7 @@ impl Arguments {
             }
         }
         for (key, values) in &result.values {
-            if values.len() > 1 && !matches!(key.as_str(), "--to" | "--tag") {
+            if values.len() > 1 && !matches!(key.as_str(), "--to" | "--tag" | "--attach") {
                 bail!("option {key} may only be supplied once");
             }
         }
@@ -436,6 +436,7 @@ pub(crate) fn run_verb(args: &Arguments, verb: &str, client: &mut Client) -> Res
                 "--tag",
                 "--meta-json",
                 "--meta-file",
+                "--attach",
                 "--ttl-seconds",
                 "--idempotency-key",
             ];
@@ -452,7 +453,7 @@ pub(crate) fn run_verb(args: &Arguments, verb: &str, client: &mut Client) -> Res
             )?;
             args.words(if verb == "send" { 1 } else { 2 })?;
             let message = args.required("--message")?;
-            let metadata = meta(args)?;
+            let metadata = crate::files::attach(&client.root, &args.many("--attach"), meta(args)?)?;
             let ttl_seconds = args
                 .get("--ttl-seconds")
                 .map(|value| value.parse::<u64>())
@@ -685,7 +686,7 @@ pub fn help() -> &'static str {
      notify register --adapter command --command 'PROGRAM ARGS {prompt}'\n\
      activity working|idle|offline [--detail TEXT]\n\
      notify status | notify retry MESSAGE_ID\n\
-       send/reply: [--tag TAG ...] [--meta-json JSON | --meta-file PATH]\n\
+       send/reply: [--tag TAG ...] [--meta-json JSON | --meta-file PATH] [--attach IMAGE ...]\n\
                    [--ttl-seconds N] [--idempotency-key ULID]\n\
      history | inbox | search TEXT | thread ID\n\
        [--group GROUP] [--sender AGENT] [--tag TAG ...] [--after ID] [--before ID]\n\

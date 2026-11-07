@@ -2,6 +2,7 @@ mod app;
 mod board;
 mod cli;
 mod client;
+mod files;
 mod http;
 mod mcp;
 mod model;

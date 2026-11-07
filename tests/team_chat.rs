@@ -388,3 +388,80 @@ fn failed_wake_up_shows_its_reason_in_the_chat() {
     assert_eq!(coo["activity"]["state"], "offline");
     assert_eq!(coo["activity"]["detail"], "Last wake-up failed: You have hit your session limit");
 }
+
+fn http_raw(url: &str, path: &str, content_type: &str, body: &[u8]) -> (u16, Value) {
+    let address = url.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nX-Zboard: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    (head.split(' ').nth(1).unwrap().parse().unwrap(), serde_json::from_str(body).unwrap_or(Value::Null))
+}
+
+fn get_bytes(url: &str, path: &str) -> (String, Vec<u8>) {
+    let address = url.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    (String::from_utf8_lossy(&response[..split]).into_owned(), response[split + 4..].to_vec())
+}
+
+#[test]
+fn screenshots_from_agents_and_the_founder_show_in_the_chat() {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake-image-bytes";
+    let board = Board::new();
+    let (_web, url) = board.web();
+    board.scripted_agent("developer", "ok");
+
+    // An agent attaches a screenshot from its machine.
+    let shot = board.base.join("settings.png");
+    std::fs::write(&shot, PNG).unwrap();
+    let sent = board.cli(
+        "developer",
+        &["send", "--group", "team", "--message", "New settings page", "--attach", shot.to_str().unwrap()],
+    );
+    let attached = sent["message"]["meta"]["attachments"][0].clone();
+    assert_eq!(attached["type"], "image/png");
+    assert_eq!(attached["name"], "settings.png");
+    let file = attached["file"].as_str().unwrap().to_owned();
+    let (head, bytes) = get_bytes(&url, &format!("/files/{file}"));
+    assert!(head.starts_with("HTTP/1.1 200") && head.contains("Content-Type: image/png"), "{head}");
+    assert!(head.contains("nosniff"), "{head}");
+    assert_eq!(bytes, PNG);
+    assert!(get_bytes(&url, "/files/../board/v1").0.starts_with("HTTP/1.1 404"));
+
+    // Not an image: refused.
+    let notes = board.base.join("notes.png");
+    std::fs::write(&notes, b"secret text").unwrap();
+    let output = board
+        .command()
+        .args(["send", "--group", "team", "--message", "x", "--attach", notes.to_str().unwrap()])
+        .args(["--session", "developer", "--identity-project", "demo"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+
+    // The founder pastes a screenshot and sends it with no text.
+    let (status, up) = http_raw(&url, "/api/upload?name=Screen%20Shot.png", "image/png", PNG);
+    assert_eq!(status, 200, "{up}");
+    assert_eq!(up["data"]["name"], "Screen Shot.png");
+    let (status, posted) = http(&url, "POST", "/api/send", Some(&json!({"text": "", "attachments": [up["data"]]})));
+    assert_eq!(status, 200, "{posted}");
+    assert_eq!(posted["data"]["message"]["meta"]["attachments"][0]["file"], up["data"]["file"]);
+    assert_eq!(posted["data"]["message"]["meta"]["human"], true);
+    // A claim about a file that isn't on the board is refused.
+    let (status, _) = http(&url, "POST", "/api/send", Some(&json!({"text": "x",
+        "attachments": [{"file": "01m6tmkvr4tq35fkgh2nf2295z.png"}]})));
+    assert_eq!(status, 400);
+    let (status, _) = http_raw(&url, "/api/upload?name=x.html", "text/html", b"<script>alert(1)</script>");
+    assert_eq!(status, 400);
+}

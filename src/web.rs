@@ -115,7 +115,8 @@ pub fn run(options: WebOptions) -> Result<()> {
     let allowed_hosts = Arc::new(allowed_hosts(address));
     http::serve(
         listener,
-        256 * 1024,
+        // Screenshots are uploaded as raw image bodies (up to 10 MB).
+        crate::files::MAX_BYTES as usize + 64 * 1024,
         Arc::new(move |request| route(&web, &allowed_hosts, request)),
     )
 }
@@ -155,8 +156,15 @@ fn route(web: &Arc<Mutex<Web>>, allowed_hosts: &[String], request: Request) -> R
     let mut web = web.lock().unwrap();
     let result = match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => return Response::html(PAGE),
+        ("GET", path) if path.starts_with("/files/") => {
+            return match crate::files::read(&web.root, &path["/files/".len()..]) {
+                Some((bytes, kind)) => Response::file(kind, bytes),
+                None => Response::error(404, "not found"),
+            }
+        }
         ("GET", "/api/state") => web.state(&request),
         ("GET", "/api/thread") => web.thread(&request),
+        ("POST", "/api/upload") => web.upload(&request),
         ("POST", "/api/send") => request.json().and_then(|body| web.send(&body)),
         ("POST", "/api/answer") => request.json().and_then(|body| web.answer(&body)),
         ("POST", "/api/continue") => request.json().and_then(|body| web.carry_on(&body)),
@@ -341,8 +349,31 @@ impl Web {
         Ok(json!({"message": message, "notifications": client.notifications}))
     }
 
+    /// A screenshot pasted, dropped or picked in the chat page. The body is
+    /// the raw image; it is stored now and attached when the message is sent.
+    fn upload(&mut self, request: &Request) -> Result<Value> {
+        let name = request.query.get("name").cloned().unwrap_or_default();
+        crate::files::store_bytes(&self.root, &request.body, &name)
+    }
+
+    /// The person's message metadata, with any uploaded attachments.
+    fn person_meta(&self, body: &Value, extra: Value) -> Result<Value> {
+        let meta = Self::human_meta(extra);
+        match body["attachments"].as_array() {
+            Some(claimed) if !claimed.is_empty() => {
+                crate::files::with_attachments(Some(meta), crate::files::verify(&self.root, claimed)?)
+            }
+            _ => Ok(meta),
+        }
+    }
+
     fn send(&mut self, body: &Value) -> Result<Value> {
-        let message = text(body, "text")?;
+        let has_files = body["attachments"].as_array().is_some_and(|a| !a.is_empty());
+        let message = match text(body, "text") {
+            // A screenshot on its own is a fine message.
+            Err(_) if has_files => "(image)".to_owned(),
+            other => other?,
+        };
         let mut tags: Vec<String> = body["tags"]
             .as_array()
             .map(|tags| tags.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect())
@@ -350,7 +381,8 @@ impl Web {
         tags.extend(hash_tags(&message));
         if let Some(parent) = body["reply_to"].as_str() {
             let tags = (!tags.is_empty()).then_some(tags);
-            return self.reply(parent, message, tags, json!({}));
+            let meta = self.person_meta(body, json!({}))?;
+            return self.reply(parent, message, tags, meta);
         }
         let to: Vec<String> = body["to"]
             .as_array()
@@ -364,13 +396,14 @@ impl Web {
         if let Some(group) = &group {
             self.ensure_member(group)?;
         }
+        let meta = self.person_meta(body, json!({}))?;
         let mut client = self.client()?;
         let sent = client.send(SendRequest {
             to,
             group,
             message,
             tags,
-            meta: Some(Self::human_meta(json!({}))),
+            meta: Some(meta),
             ..Default::default()
         })?;
         self.refreshed = None;

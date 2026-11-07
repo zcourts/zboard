@@ -52,6 +52,20 @@ impl Response {
         Self::json(status, &serde_json::json!({"ok": false, "error": message.to_string()}))
     }
 
+    /// A stored attachment. Images only; never sniffed as anything else.
+    pub fn file(content_type: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            content_type,
+            body,
+            headers: vec![
+                ("X-Content-Type-Options", "nosniff".into()),
+                ("Cache-Control", "private, max-age=31536000, immutable".into()),
+                ("Content-Security-Policy", "default-src 'none'; sandbox".into()),
+            ],
+        }
+    }
+
     pub fn html(body: &'static str) -> Self {
         Self {
             status: 200,

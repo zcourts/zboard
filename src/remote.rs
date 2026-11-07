@@ -377,6 +377,10 @@ fn remote_cli(root: &Path, record: &TokenRecord, body: &Value) -> Result<Value> 
     {
         bail!("{key} is set by your access token, not by the request");
     }
+    // Both name a file on this machine; a remote agent must not read our disk.
+    if let Some(key) = ["--attach", "--meta-file"].into_iter().find(|key| args.values.contains_key(*key)) {
+        bail!("{key} is not available remotely");
+    }
     if let Some(message) = args.get("--message") {
         check_message_size(&Value::String(message))?;
     }
@@ -393,6 +397,10 @@ fn remote_mcp(state: &Arc<Mutex<ServeState>>, root: &Path, record: &TokenRecord,
     check_message_size(&arguments["message"])?;
     if tool == "identity_use" {
         bail!("remote agents' identity is fixed by their access token");
+    }
+    // Paths would name files on the serving machine, not the caller's.
+    if arguments["attachments"].as_array().is_some_and(|a| !a.is_empty()) {
+        bail!("attachments are not available remotely yet");
     }
     let server = {
         let mut guard = state.lock().unwrap();

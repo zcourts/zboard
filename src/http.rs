@@ -167,6 +167,11 @@ fn read_request(reader: &mut impl BufRead, peer: SocketAddr, max_body: usize) ->
         .map_err(|_| anyhow::anyhow!("invalid content-length"))?
         .unwrap_or(0);
     if length > max_body {
+        // Read and discard a moderately oversized body so the client sees our
+        // 413 instead of a reset connection; give up on anything huge.
+        if length <= 4 * 1024 * 1024 {
+            let _ = std::io::copy(&mut reader.take(length as u64), &mut std::io::sink());
+        }
         return Err(RequestError::TooLarge);
     }
     let mut body = vec![0; length];

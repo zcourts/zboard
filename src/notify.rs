@@ -457,6 +457,11 @@ fn deliver_at(base: &Path, board: &Path, agent: &str, ids: &[String], human: boo
         file.write_all(format!("{status}\n").as_bytes())?;
         file.sync_all()?;
     }
+    // One marker per wake-up, however many messages it carried, for the
+    // rate limit.
+    let turns = receipts.join("turns");
+    private_dir(&turns)?;
+    private_file(&turns.join(ulid::Ulid::new().to_string()))?;
     Ok(status.into())
 }
 
@@ -468,24 +473,28 @@ fn wake_limit() -> usize {
         .unwrap_or(DEFAULT_WAKE_LIMIT)
 }
 
-/// Wake-ups started for this agent in the last ten minutes. A second loop
-/// guard for agents that wake each other with new messages, not replies.
+/// Wake-ups (turns, not messages) started for this agent in the last ten
+/// minutes. A second loop guard for agents that wake each other with new
+/// messages rather than replies. Markers older than an hour are removed.
 fn recent_wakes(receipts: &Path) -> usize {
-    let floor = SystemTime::now() - Duration::from_secs(600);
-    fs::read_dir(receipts)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".queued"))
-                .filter(|entry| {
-                    entry
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .is_ok_and(|time| time >= floor)
-                })
-                .count()
-        })
-        .unwrap_or(0)
+    let now = SystemTime::now();
+    let floor = now - Duration::from_secs(600);
+    let stale = now - Duration::from_secs(3600);
+    let Ok(entries) = fs::read_dir(receipts.join("turns")) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified < stale {
+            let _ = fs::remove_file(entry.path());
+        } else if modified >= floor {
+            count += 1;
+        }
+    }
+    count
 }
 
 enum TurnStart {
@@ -1006,7 +1015,10 @@ mod tests {
             serde_json::to_vec(&registration).unwrap(),
         )
         .unwrap();
-        for _ in 0..DEFAULT_WAKE_LIMIT {
+        // A batch of many messages is one wake-up.
+        let batch: Vec<String> = (0..20).map(|_| ulid::Ulid::new().to_string()).collect();
+        assert_eq!(deliver_at(&base, dir.path(), "receiver", &batch, false).unwrap(), "queued");
+        for _ in 1..DEFAULT_WAKE_LIMIT {
             let id = vec![ulid::Ulid::new().to_string()];
             assert_eq!(deliver_at(&base, dir.path(), "receiver", &id, false).unwrap(), "queued");
         }
@@ -1015,6 +1027,7 @@ mod tests {
             deliver_at(&base, dir.path(), "receiver", &id, false).unwrap(),
             "paused_rate_limit"
         );
+        assert_eq!(recent_wakes(&base.join("receipts/receiver")), DEFAULT_WAKE_LIMIT);
         assert_eq!(deliver_at(&base, dir.path(), "receiver", &id, true).unwrap(), "queued");
     }
 }

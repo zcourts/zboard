@@ -57,6 +57,7 @@ aside.side { border-left: 1px solid var(--line); background: var(--panel); }
 .person .when, .muted { color: var(--muted); font-size: 12px; }
 .person .state { font-size: 12px; color: var(--muted); }
 .person .state.working { color: var(--warn); }
+.person .state.failed { color: var(--danger); }
 .person .last { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .badge { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 99px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
 .badge.human { color: var(--accent); }
@@ -345,10 +346,13 @@ function renderPeople() {
   $("onlineCount").textContent = `${S.agents.filter(a => a.online || a.running).length}/${S.agents.length} online`;
   $("people").innerHTML = people.map(a => {
     const working = a.running || (a.activity && a.activity.state === "working");
-    const state = working ? "Working" + (a.activity && a.activity.detail ? " · " + a.activity.detail : "") : a.online ? "Online" : a.last_seen ? "Last seen " + rel(a.last_seen) : "Not seen yet";
+    const failed = !working && a.activity && a.activity.state === "offline" && a.activity.detail;
+    const state = working ? "Working" + (a.activity && a.activity.detail ? " · " + a.activity.detail : "")
+      : failed ? a.activity.detail + " (" + rel(a.activity.at) + ")"
+      : a.online ? "Online" : a.last_seen ? "Last seen " + rel(a.last_seen) : "Not seen yet";
     return `<div class="person ${S.person === a.id ? "active" : ""}" data-person="${esc(a.id)}">${avatar(a.id)}<div class="meta">
       <div class="row1"><span class="name">${esc(a.name)}</span><span class="when">${a.last ? rel(a.last.timestamp) : ""}</span></div>
-      <div class="state ${working ? "working" : ""}">${esc(state)}${a.human ? ' <span class="badge human">person</span>' : ""}${a.project !== (S.me && S.me.project) ? ' <span class="badge">' + esc(a.project) + "</span>" : ""}</div>
+      <div class="state ${working ? "working" : failed ? "failed" : ""}">${esc(state)}${a.human ? ' <span class="badge human">person</span>' : ""}${a.project !== (S.me && S.me.project) ? ' <span class="badge">' + esc(a.project) + "</span>" : ""}</div>
       <div class="last">${a.last ? esc(a.last.text) : '<i>No messages yet</i>'}</div></div></div>`;
   }).join("") || '<div class="empty">No agents yet.</div>';
 }
@@ -399,7 +403,8 @@ async function addRule() { const text = $("ruleInput").value.trim(); if (!text) 
 
 function renderComposer() {
   const to = $("composerTo");
-  if (S.person) to.innerHTML = `Direct message to <b>${esc(nameOf(S.person))}</b>`;
+  if (S.person && S.me && S.person !== S.me.id) to.innerHTML = `Direct message to <b>${esc(nameOf(S.person))}</b>`;
+  else if (S.person) to.innerHTML = `To <b>${esc(S.team)}</b>, the team room everyone reads (showing your own messages)`;
   else if (S.view === "direct") {
     if (to.querySelector("select") && document.activeElement === to.querySelector("select")) return;
     to.innerHTML = `Direct message to <select id="dmTo"><option value="">choose an agent…</option>${S.agents.filter(a => S.me && a.id !== S.me.id).sort((a,b)=>a.name.localeCompare(b.name)).map(a => `<option value="${esc(a.id)}" ${S.dmTo === a.id ? "selected" : ""}>${esc(a.name)}</option>`).join("")}</select>`;
@@ -414,7 +419,8 @@ function renderAll(scroll) {
 async function send() {
   const input = $("input"); const text = input.value.trim(); if (!text) return;
   const body = { text };
-  if (S.person) body.to = [S.person];
+  if (S.person && S.person !== S.me.id) body.to = [S.person];
+  else if (S.person) body.group = S.team;
   else if (S.view === "direct") { if (!S.dmTo) { toast("Choose who to message"); return; } body.to = [S.dmTo]; }
   else body.group = S.team;
   $("sendBtn").disabled = true;

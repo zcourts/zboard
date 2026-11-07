@@ -358,3 +358,33 @@ fn remote_agent_joins_with_a_token_and_is_refused_without_one() {
     assert_eq!(refused["ok"], false, "{refused}");
     let _ = Path::new(&remote);
 }
+
+#[test]
+fn failed_wake_up_shows_its_reason_in_the_chat() {
+    let board = Board::new();
+    board.cli("coo", &["identity"]);
+    let status = board
+        .command()
+        .args(["wake-exec", "--root"])
+        .arg(&board.root)
+        .args(["--agent", "demo-coo", "--lock"])
+        .arg(board.base.join("coo.lock"))
+        .arg("--log")
+        .arg(board.base.join("coo.log"))
+        .args(["--ids", "X", "--", "/bin/sh", "-c", "echo 'You have hit your session limit'; exit 1"])
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (_web, url) = board.web();
+    let (_, state) = http(&url, "GET", "/api/state", None);
+    let coo = state["data"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "demo-coo")
+        .unwrap()
+        .clone();
+    assert_eq!(coo["activity"]["state"], "offline");
+    assert_eq!(coo["activity"]["detail"], "Last wake-up failed: You have hit your session limit");
+}

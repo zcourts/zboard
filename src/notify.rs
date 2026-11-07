@@ -650,14 +650,50 @@ pub fn wake_exec(mut args: impl Iterator<Item = String>) -> Result<()> {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    let output_start = log.metadata()?.len();
     let result = command.status();
-    let _ = crate::board::set_activity(&root, &agent, "idle", None);
+    // Tell the team when a turn fails (for example a subscription limit),
+    // using the last line the agent printed.
+    let failure = match &result {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(last_line(&log_path, output_start).unwrap_or_else(|| format!("exited with {status}"))),
+        Err(error) => Some(format!("could not start: {error}")),
+    };
+    match &failure {
+        None => {
+            let _ = crate::board::set_activity(&root, &agent, "idle", None);
+        }
+        Some(reason) => {
+            let _ = crate::board::set_activity(
+                &root,
+                &agent,
+                "offline",
+                Some(format!("Last wake-up failed: {reason}")),
+            );
+        }
+    }
     match result {
         Ok(status) => writeln!(log, "--- finished: {status}")?,
         Err(error) => writeln!(log, "--- could not start: {error}")?,
     }
     drop(lock_file);
     Ok(())
+}
+
+/// Last non-empty line written to a log after `from`, trimmed to 160 chars.
+fn last_line(path: &Path, from: u64) -> Option<String> {
+    use std::io::Seek;
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(std::io::SeekFrom::Start(from.max(length.saturating_sub(4096))))
+        .ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("--- "))
+        .map(|line| line.chars().take(160).collect())
 }
 
 fn queue(codex: &Path, thread: &str, message: &str, diagnostics: &Path) -> Result<()> {
@@ -915,6 +951,17 @@ mod tests {
         let ids = vec!["A".to_owned(), "B".to_owned()];
         let argv = expand(&registration.command, "hello $(whoami)", &ids, &registration, Path::new("/b"));
         assert_eq!(argv, ["tmux", "send-keys", "-t", "coo", "hello $(whoami); ids A B"]);
+    }
+
+    #[test]
+    fn failed_turns_report_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("agent.log");
+        fs::write(&log, "--- old wake\nold output\n").unwrap();
+        let start = fs::metadata(&log).unwrap().len();
+        fs::write(&log, "--- old wake\nold output\nYou've hit your session limit\n\n").unwrap();
+        assert_eq!(last_line(&log, start).as_deref(), Some("You've hit your session limit"));
+        assert_eq!(last_line(&log, fs::metadata(&log).unwrap().len()), None);
     }
 
     #[test]

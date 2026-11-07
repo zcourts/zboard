@@ -36,6 +36,8 @@ header.top { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px;
 header.top h1 { font-size: 15px; margin: 0; font-weight: 650; }
 header.top .sub { color: var(--muted); font-size: 12px; }
 header.top .spacer { flex: 1; }
+.browsing { font-size: 12px; padding: 3px 10px; border-radius: 99px; background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45vw; }
+.browsing:empty { display: none; }
 .icon-btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 5px 9px; }
 .icon-btn:hover { background: var(--panel-2); }
 aside, main { min-height: 0; display: flex; flex-direction: column; }
@@ -157,6 +159,7 @@ footer.notice { grid-column: 1 / -1; font-size: 11px; color: var(--muted); paddi
     <h1 id="title">Team chat</h1>
     <span class="sub" id="subtitle"></span>
     <span class="spacer"></span>
+    <span class="browsing" id="browsing" title="Agents using a browser right now"></span>
     <button class="icon-btn" id="notifyBtn" title="Desktop notifications for Needs you">🔔</button>
     <button class="icon-btn" id="themeBtn" title="Light or dark">◐</button>
   </header>
@@ -356,7 +359,14 @@ function renderMessages(scrollToEnd) {
   else note.classList.remove("show");
 }
 
+// Who is using a browser right now (agents report "🌐 Browsing <site>").
+function renderBrowsing() {
+  const now = S.agents.filter(a => (a.running || (a.activity && a.activity.state === "working"))
+    && a.activity && typeof a.activity.detail === "string" && a.activity.detail.startsWith("🌐"));
+  $("browsing").textContent = now.map(a => `🌐 ${a.name}: ${a.activity.detail.replace(/^🌐\s*/, "")}`).join(" · ");
+}
 function renderPeople() {
+  renderBrowsing();
   const people = [...S.agents].sort((a, b) => {
     const ta = a.last ? a.last.id : "", tb = b.last ? b.last.id : "";
     return ta === tb ? a.name.localeCompare(b.name) : ta < tb ? 1 : -1;

@@ -555,7 +555,7 @@ pub(crate) fn message_id_path(root: &Path, route: &str, message_id: &str) -> Res
         .join(format!("{message_id}{DOCUMENT_SUFFIX}")))
 }
 
-fn recent_paths(root: &Path, route: &str) -> Vec<PathBuf> {
+pub(crate) fn recent_paths(root: &Path, route: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for offset in 0..=RECENT_MINUTES {
         let time = Utc::now() - chrono::Duration::minutes(offset);
@@ -734,7 +734,7 @@ fn prune_empty_expiry_ancestors(start: &Path, root: &Path) {
     }
 }
 
-fn is_expired(message: &Message) -> bool {
+pub(crate) fn is_expired(message: &Message) -> bool {
     message.expires_at.as_deref().is_some_and(|value| {
         DateTime::parse_from_rfc3339(value).is_ok_and(|time| time.with_timezone(&Utc) <= Utc::now())
     })
@@ -749,7 +749,7 @@ fn stable_shard(value: &str) -> String {
     format!("{:02x}", hash & 0xff)
 }
 
-fn document_files_recursive(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn document_files_recursive(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_owned()];
     let mut files = Vec::new();
     while let Some(directory) = pending.pop() {
@@ -772,7 +772,7 @@ fn document_files_recursive(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn newest_paths(route_root: &Path, limit: usize) -> Vec<PathBuf> {
+pub(crate) fn newest_paths(route_root: &Path, limit: usize) -> Vec<PathBuf> {
     let mut directories = vec![route_root.to_owned()];
     for _ in 0..5 {
         let mut next = Vec::new();
@@ -808,7 +808,7 @@ fn document_id(path: &Path) -> Option<Ulid> {
         .ok()
 }
 
-fn prune(directory: &Path, retain: usize) {
+pub(crate) fn prune(directory: &Path, retain: usize) {
     let mut paths = document_files_recursive(directory);
     paths.sort();
     let remove = paths.len().saturating_sub(retain);

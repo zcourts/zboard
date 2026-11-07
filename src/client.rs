@@ -91,18 +91,31 @@ impl Client {
             .into_iter()
             .next()
             .context("message not found or not relevant")?;
+        self.reply_to_message(parent, request)
+    }
+
+    /// Reply to a message already in hand. The board owner's chat page uses
+    /// this for agent-to-agent conversations it can read but is not part of.
+    pub fn reply_to_message(&mut self, parent: Message, request: ReplyRequest) -> Result<Message> {
         let recipients = if parent.group.is_some() {
             Vec::new()
         } else {
             storage::direct_reply_recipients(&parent, &self.agent.id)
         };
+        let human = request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(crate::board::HUMAN_KEY))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let hops = crate::board::next_hops(Some(&parent), human);
         self.publish(
             SendRequest {
                 to: recipients,
                 group: parent.group,
                 message: request.message,
                 tags: request.tags.unwrap_or(parent.tags),
-                meta: request.meta,
+                meta: crate::board::stamp_hops(request.meta, hops),
                 ttl_seconds: request.ttl_seconds,
                 idempotency_key: request.idempotency_key,
             },

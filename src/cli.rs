@@ -10,14 +10,14 @@ use crate::client::{Client, ReplyRequest, SendRequest};
 use crate::{query, routed, storage};
 
 #[derive(Debug, Default)]
-struct Arguments {
-    words: Vec<String>,
-    values: BTreeMap<String, Vec<String>>,
-    switches: BTreeSet<String>,
+pub(crate) struct Arguments {
+    pub(crate) words: Vec<String>,
+    pub(crate) values: BTreeMap<String, Vec<String>>,
+    pub(crate) switches: BTreeSet<String>,
 }
 
 impl Arguments {
-    fn parse(args: impl Iterator<Item = String>) -> Result<Self> {
+    pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Self> {
         let mut result = Self::default();
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -48,17 +48,17 @@ impl Arguments {
             }
         }
         for (key, values) in &result.values {
-            if values.len() > 1 && !matches!(key.as_str(), "--to" | "--tag") {
+            if values.len() > 1 && !matches!(key.as_str(), "--to" | "--tag" | "--attach") {
                 bail!("option {key} may only be supplied once");
             }
         }
         Ok(result)
     }
 
-    fn get(&self, key: &str) -> Option<String> {
+    pub(crate) fn get(&self, key: &str) -> Option<String> {
         self.values.get(key).and_then(|v| v.first()).cloned()
     }
-    fn required(&self, key: &str) -> Result<String> {
+    pub(crate) fn required(&self, key: &str) -> Result<String> {
         self.get(key)
             .with_context(|| format!("required option {key}"))
     }
@@ -77,6 +77,8 @@ impl Arguments {
                 "--project",
                 "--identity-project",
                 "--request-id",
+                "--remote",
+                "--token",
             ]
             .contains(&key.as_str())
                 && !allowed.contains(&key.as_str())
@@ -332,17 +334,66 @@ fn execute(args: &Arguments) -> Result<Value> {
         }
         return Ok(json!({"id":ulid::Ulid::new().to_string()}));
     }
+    if let Some(remote) = crate::remote::Remote::from_args(args)? {
+        return remote.cli(args);
+    }
     let mut client = open(args, verb)?;
+    run_verb(args, verb, &mut client)
+}
+
+/// Run one command as an already-resolved identity. `zboard serve` calls this
+/// for remote agents with the identity bound to their access token.
+pub(crate) fn run_verb(args: &Arguments, verb: &str, client: &mut Client) -> Result<Value> {
     match verb {
+        "activity" => {
+            args.validate(&["--detail"], &[])?;
+            args.words(2)?;
+            Ok(serde_json::to_value(crate::board::set_activity(
+                &client.root,
+                &client.agent.id,
+                &args.words[1],
+                args.get("--detail"),
+            )?)?)
+        }
         "notify" => {
-            args.validate(&["--codex"], &[])?;
+            args.validate(
+                &[
+                    "--codex",
+                    "--adapter",
+                    "--binary",
+                    "--resume",
+                    "--mcp-server",
+                    "--command",
+                    "--cwd",
+                ],
+                &[],
+            )?;
             match args.words.get(1).map(String::as_str) {
                 Some("register") => {
                     args.words(2)?;
-                    Ok(serde_json::to_value(crate::notify::register(
+                    let adapter = args.get("--adapter").unwrap_or_else(|| "codex".into());
+                    if adapter == "codex" {
+                        return Ok(serde_json::to_value(crate::notify::register(
+                            &client.root,
+                            &client.agent,
+                            args.get("--codex").map(PathBuf::from),
+                        )?)?);
+                    }
+                    let command = match args.get("--command") {
+                        Some(template) => split_command(&template)?,
+                        None => Vec::new(),
+                    };
+                    Ok(serde_json::to_value(crate::notify::register_adapter(
                         &client.root,
                         &client.agent,
-                        args.get("--codex").map(PathBuf::from),
+                        crate::notify::AdapterOptions {
+                            adapter,
+                            binary: args.get("--binary").map(PathBuf::from),
+                            resume: args.get("--resume"),
+                            mcp_server: args.get("--mcp-server"),
+                            command,
+                            cwd: args.get("--cwd").map(PathBuf::from),
+                        },
                     )?)?)
                 }
                 Some("unregister") => {
@@ -378,13 +429,14 @@ fn execute(args: &Arguments) -> Result<Value> {
                 _ => bail!("expected notify register|unregister|status|retry ID"),
             }
         }
-        "watch" => watch(&mut client, args),
+        "watch" => watch(client, args),
         "send" | "reply" => {
             let mut allowed = vec![
                 "--message",
                 "--tag",
                 "--meta-json",
                 "--meta-file",
+                "--attach",
                 "--ttl-seconds",
                 "--idempotency-key",
             ];
@@ -401,7 +453,7 @@ fn execute(args: &Arguments) -> Result<Value> {
             )?;
             args.words(if verb == "send" { 1 } else { 2 })?;
             let message = args.required("--message")?;
-            let metadata = meta(args)?;
+            let metadata = crate::files::attach(&client.root, &args.many("--attach"), meta(args)?)?;
             let ttl_seconds = args
                 .get("--ttl-seconds")
                 .map(|value| value.parse::<u64>())
@@ -579,14 +631,62 @@ fn execute(args: &Arguments) -> Result<Value> {
     }
 }
 
+/// Split a command template into arguments. Supports single and double
+/// quotes and backslash escapes; nothing is ever passed to a shell.
+pub(crate) fn split_command(template: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = template.chars();
+    while let Some(character) = chars.next() {
+        match (quote, character) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') | (None, '\\') => {
+                current.push(chars.next().context("trailing backslash in --command")?);
+                in_word = true;
+            }
+            (Some(_), c) => current.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(character);
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        bail!("unterminated quote in --command");
+    }
+    if in_word {
+        words.push(current);
+    }
+    if words.is_empty() {
+        bail!("--command is empty");
+    }
+    Ok(words)
+}
+
 pub fn help() -> &'static str {
     "Zboard one-shot commands (JSON responses; no listener checkpoint is changed):\n\
      message get ID [ID ...]\n\
      send (--to AGENT [--to AGENT ...] | --group GROUP) --message TEXT\n\
      reply ID --message TEXT [--clear-tags]\n\
      notify register [--codex /absolute/path/to/codex] | notify unregister\n\
+     notify register --adapter claude|gemini [--resume SESSION] [--mcp-server NAME]\n\
+                     [--binary PATH] [--cwd DIR]\n\
+     notify register --adapter command --command 'PROGRAM ARGS {prompt}'\n\
+     activity working|idle|offline [--detail TEXT]\n\
      notify status | notify retry MESSAGE_ID\n\
-       send/reply: [--tag TAG ...] [--meta-json JSON | --meta-file PATH]\n\
+       send/reply: [--tag TAG ...] [--meta-json JSON | --meta-file PATH] [--attach IMAGE ...]\n\
                    [--ttl-seconds N] [--idempotency-key ULID]\n\
      history | inbox | search TEXT | thread ID\n\
        [--group GROUP] [--sender AGENT] [--tag TAG ...] [--after ID] [--before ID]\n\
@@ -599,6 +699,7 @@ pub fn help() -> &'static str {
      group create NAME | group join NAME\n\
      id new\n\
      Common: --root PATH --session ID --identity-project PROJECT --path PATH\n\
+             --remote URL --token TOKEN (or ZBOARD_REMOTE / ZBOARD_TOKEN)\n\
              --request-id CORRELATION\n\
      Identity defaults to the session environment and existing registration.\n\
      Run identity once to register a new session. Read commands require registration.\n\
